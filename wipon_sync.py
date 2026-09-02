@@ -36,10 +36,10 @@ from config import Config, ConfigError
 from state import SyncState
 from transform import (
     build_branch_summary,
+    sale_row_sort_key,
     SaleRow,
     sale_sort_key,
     sales_to_rows,
-    split_rows_by_branch,
 )
 
 log = logging.getLogger("wipon_sync")
@@ -241,33 +241,33 @@ def print_rows(rows: Sequence[SaleRow]) -> None:
 # БЛОК 5. Основной сценарий
 # ----------------------------------------------------------------------
 
-def update_reports(cfg: Config, tz) -> None:
-    """Перестраиваем листы филиалов и сводку по тому, что лежит в таблице.
+def sale_ids_from_blocks(by_branch: dict) -> set:
+    """Собираем ID продаж из прочитанных блоков — для защиты от дублей."""
+    ids = set()
+    for rows in by_branch.values():
+        for row in rows:
+            sale_id = str(row[5]).strip() if len(row) > 5 else ""
+            if sale_id:
+                ids.add(sale_id)
+    return ids
 
-    Считаем именно по таблице, а не по свежей порции продаж: иначе после
-    запуска, в котором не было новых чеков, сводка обнулилась бы.
-    Ошибку сюда не пропускаем наверх — сводка это витрина, из-за неё
-    не должен падать весь запуск, продажи уже записаны.
+
+def update_summary_sheet(cfg: Config, tz, by_branch: dict) -> None:
+    """Обновляем лист «Сводка» по блокам, которые лежат в таблице.
+
+    Ошибку наверх не пропускаем: сводка — витрина, из-за неё не должен
+    падать запуск, продажи к этому моменту уже записаны.
     """
     from sheets import SheetsWriter
 
     try:
-        writer = SheetsWriter(cfg)
-        # Один раз читаем общий лист — он первоисточник и для листов
-        # филиалов, и для сводки.
-        sheet_rows = writer.read_data_rows()
-
-        # Отдельный лист под каждый филиал, с итогом внизу.
-        writer.write_branch_sheets(split_rows_by_branch(sheet_rows))
-
-        # Общая сводка: все филиалы в одном месте.
-        writer.write_summary(
+        SheetsWriter(cfg).write_summary(
             cfg.item_filter,
-            build_branch_summary(sheet_rows),
+            build_branch_summary(by_branch),
             datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S"),
         )
     except Exception as exc:                      # noqa: BLE001
-        log.warning("Не удалось обновить отчёты по филиалам: %s", exc)
+        log.warning("Не удалось обновить сводку: %s", exc)
 
 
 def run(args) -> int:
@@ -300,7 +300,11 @@ def run(args) -> int:
         state.last_sync_at = started_at
         state.save()
         if not args.dry_run:
-            update_reports(cfg, tz)
+            from sheets import SheetsWriter
+
+            writer = SheetsWriter(cfg)
+            writer.ensure_sheet()
+            update_summary_sheet(cfg, tz, writer.read_branch_blocks())
         return 0
 
     # --- Шаг 3: превращаем продажи в строки таблицы ---
@@ -316,22 +320,37 @@ def run(args) -> int:
     from sheets import SheetsWriter
 
     writer = SheetsWriter(cfg)
-    writer.ensure_sheet_and_header()
+    writer.ensure_sheet()
+
+    # Читаем то, что уже записано. Таблица — первоисточник: скрипт не хранит
+    # продажи у себя, а блоки перезаписываются целиком, поэтому старые строки
+    # нужно вычитать и дополнить новыми.
+    by_branch = writer.read_branch_blocks()
 
     # Вторая проверка на дубли — уже по самой таблице. Помогает, если
     # state.json потеряли или скрипт запустили на другом компьютере.
     if cfg.reconcile_with_sheet:
-        state.add_known_ids(writer.existing_sale_ids())
+        known_ids = sale_ids_from_blocks(by_branch)
+        log.info("В таблице уже записано продаж: %d", len(known_ids))
+        state.add_known_ids(known_ids)
         sales = sorted(filter_new_sales(sales, state), key=sale_sort_key)
         rows = sales_to_rows(sales, item_titles, tz, cfg.item_filter)
         if not rows:
             log.info("После сверки с таблицей новых строк не осталось")
             state.last_sync_at = started_at
             state.save()
-            update_reports(cfg, tz)
+            update_summary_sheet(cfg, tz, by_branch)
             return 0
 
-    written = writer.append_rows([r.as_sheet_row() for r in rows])
+    # Раскладываем новые строки по блокам их филиалов и сортируем каждый блок,
+    # чтобы продажи шли по порядку, а не хвостом в конце.
+    for row in rows:
+        by_branch.setdefault(row.branch, []).append(row.as_block_row())
+    for branch_rows in by_branch.values():
+        branch_rows.sort(key=sale_row_sort_key)
+
+    writer.write_branch_blocks(by_branch)
+    written = len(rows)
 
     # --- Шаг 5: запоминаем результат ---
     # Состояние обновляем ТОЛЬКО после успешной записи: если бы запись
@@ -341,7 +360,7 @@ def run(args) -> int:
     state.save()
 
     # --- Шаг 6: пересчитываем сводку по филиалам ---
-    update_reports(cfg, tz)
+    update_summary_sheet(cfg, tz, by_branch)
 
     log.info(
         "ИТОГ: обработано продаж %d, записано строк %d, последний ID продажи %s",

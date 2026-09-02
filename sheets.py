@@ -26,18 +26,6 @@ from transform import branch_sort_key
 log = logging.getLogger(__name__)
 
 # Заголовки колонок — ровно в том порядке, в котором формируются строки.
-HEADER = [
-    "Дата и время продажи",
-    "Филиал",
-    "Название товара",
-    "Количество",
-    "Цена за единицу",
-    "Сумма",
-    "ID продажи",
-]
-
-# Шапка листа отдельного филиала: колонка «Филиал» там не нужна,
-# весь лист и так про одну точку.
 BRANCH_HEADER = [
     "Дата и время продажи",
     "Название товара",
@@ -47,19 +35,32 @@ BRANCH_HEADER = [
     "ID продажи",
 ]
 
+# --- Раскладка блоков по филиалам ---
+# Каждый филиал занимает свой блок колонок, блоки идут слева направо:
+#   A..F  — первый филиал,  G и H — пустые (разделитель)
+#   I..N  — второй филиал,  O и P — пустые
+#   Q..V  — третий филиал,  W     — пустая
+# Данных в блоке шесть колонок (BLOCK_WIDTH), а шаг между началами
+# блоков — восемь (BLOCK_STEP), поэтому между ними остаётся зазор.
+BLOCK_WIDTH = 6
+BLOCK_STEP = 8
+
 # Разрешение только на работу с таблицами.
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Колонка G — «ID продажи». По ней проверяем, что уже записано.
-# (была F, сдвинулась вправо после добавления колонки «Филиал»)
-SALE_ID_COLUMN = "G"
-
-# Последняя колонка таблицы — нужна для диапазонов вида A1:G1.
-LAST_COLUMN = "G"
 
 
 class SheetsError(Exception):
     """Ошибка при работе с Google Sheets."""
+
+
+def column_letter(index: int) -> str:
+    """Номер колонки (0 = A) в её буквенное обозначение: 0→A, 7→H, 26→AA."""
+    letters = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        letters = chr(ord("A") + rest) + letters
+    return letters
 
 
 def _to_number(value: Any) -> float:
@@ -131,232 +132,181 @@ class SheetsWriter:
     # Подготовка таблицы
     # ------------------------------------------------------------------
 
-    def ensure_sheet_and_header(self) -> None:
-        """Проверяем, что лист существует и первая строка — заголовки."""
+    def ensure_sheet(self) -> None:
+        """Проверяем, что лист существует, и запоминаем его sheetId.
+
+        Строку заголовков здесь не пишем: в новой раскладке первая строка
+        занята названиями филиалов, а шапки идут внутри каждого блока —
+        всё это формируется при записи блоков.
+        """
         try:
-            meta = self.sheets.get(spreadsheetId=self.spreadsheet_id).execute()
+            self.sheets.get(spreadsheetId=self.spreadsheet_id).execute()
         except HttpError as exc:
             raise SheetsError(
                 f"Не удалось открыть таблицу {self.spreadsheet_id}. "
                 "Проверьте GOOGLE_SPREADSHEET_ID и доступ сервисного аккаунта. "
                 f"Ответ Google: {exc}"
             ) from exc
+        self._sheet_id = self._ensure_sheet_exists(self.sheet_name)
 
-        # Ищем нужный лист среди существующих и заодно запоминаем его
-        # числовой sheetId — он понадобится, чтобы задать формат колонок.
-        sheet_id = None
-        for sheet in meta.get("sheets", []):
-            props = sheet["properties"]
-            if props["title"] == self.sheet_name:
-                sheet_id = props["sheetId"]
-                break
+    def read_branch_blocks(self) -> dict:
+        """Читаем лист и разбираем его обратно на блоки по филиалам.
 
-        if sheet_id is None:
-            log.info("Лист «%s» не найден — создаю", self.sheet_name)
-            response = self.sheets.batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"requests": [{"addSheet": {"properties": {"title": self.sheet_name}}}]},
-            ).execute()
-            sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
+        Лист — это первоисточник: скрипт не хранит продажи у себя, поэтому
+        перед перезаписью он вычитывает то, что уже записано, и дополняет
+        новыми строками.
 
-        # Читаем первую строку. Если пусто — записываем заголовки.
-        first_row = (
-            self.sheets.values()
-            .get(spreadsheetId=self.spreadsheet_id, range=self._range(f"A1:{LAST_COLUMN}1"))
-            .execute()
-            .get("values", [])
-        )
-        if not first_row or not any(str(c).strip() for c in first_row[0]):
-            log.info("Записываю строку заголовков")
-            self.sheets.values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range=self._range(f"A1:{LAST_COLUMN}1"),
-                valueInputOption="USER_ENTERED",
-                body={"values": [HEADER]},
-            ).execute()
-
-        self._sheet_id = sheet_id
-        self._apply_column_formats(sheet_id)
-
-    def _apply_column_formats(
-        self, sheet_id: int, date_column: int = 0, text_column: int = 6
-    ) -> None:
-        """Задаём формат колонок, чтобы Google не искажал наши данные.
-
-        Зачем это нужно: мы пишем с valueInputOption=USER_ENTERED, то есть
-        Google сам разбирает, что мы прислали. Строку «02.09.2026 21:14:22»
-        он справедливо распознаёт как дату-время и хранит её числом
-        (у Google дата — это количество дней с 30.12.1899). Если у ячейки
-        при этом числовой формат, в таблице видно «46264,50641» вместо даты.
-        Поэтому один раз явно объявляем: колонка A — дата-время,
-        колонка F (ID продажи) — текст, чтобы длинные ID не превращались
-        в экспоненциальную запись вида 3,4379E+08.
+        Возвращаем {"2 точка": [[дата, товар, кол-во, цена, сумма, ID], ...]}.
+        Строку с названием филиала, шапку и ИТОГО в данные не берём.
         """
-        def column_format(start: int, end: int, number_format: dict) -> dict:
-            return {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1,  # строку 1 не трогаем — это заголовки
-                        "startColumnIndex": start,
-                        "endColumnIndex": end,
-                    },
-                    "cell": {"userEnteredFormat": {"numberFormat": number_format}},
-                    "fields": "userEnteredFormat.numberFormat",
-                }
-            }
-
-        requests = [
-            # Колонка с датой продажи
-            column_format(
-                date_column, date_column + 1,
-                {"type": "DATE_TIME", "pattern": "dd.mm.yyyy hh:mm:ss"},
-            ),
-            # Колонка «ID продажи» — строго текстом
-            column_format(text_column, text_column + 1, {"type": "TEXT"}),
-        ]
-        try:
-            self.sheets.batchUpdate(
-                spreadsheetId=self.spreadsheet_id, body={"requests": requests}
-            ).execute()
-        except HttpError as exc:
-            # Формат — это косметика: если не вышло, данные всё равно запишутся.
-            log.warning("Не удалось задать формат колонок (%s) — продолжаю", exc)
-
-    # ------------------------------------------------------------------
-    # Чтение уже записанного и дозапись
-    # ------------------------------------------------------------------
-
-    def existing_sale_ids(self) -> set:
-        """Читаем колонку «ID продажи» целиком.
-
-        Это вторая линия защиты от дублей: даже если файл state.json
-        удалили или потеряли, скрипт увидит, какие продажи уже в таблице.
-        """
+        last = column_letter(2 * BLOCK_STEP + BLOCK_WIDTH + 1)
         try:
             values = (
                 self.sheets.values()
                 .get(
                     spreadsheetId=self.spreadsheet_id,
-                    range=self._range(f"{SALE_ID_COLUMN}2:{SALE_ID_COLUMN}"),
-                )
-                .execute()
-                .get("values", [])
-            )
-        except HttpError as exc:
-            log.warning("Не удалось прочитать ID из таблицы (%s) — полагаюсь на state.json", exc)
-            return set()
-
-        ids = {str(row[0]).strip() for row in values if row and str(row[0]).strip()}
-        log.info("В таблице уже записано продаж: %d", len(ids))
-        return ids
-
-    def read_data_rows(self) -> List[List[Any]]:
-        """Читаем все строки листа продаж без шапки.
-
-        valueRenderOption=UNFORMATTED_VALUE — просим Google вернуть «сырые»
-        значения: числа числами, а не строкой «1 234,50», иначе их пришлось
-        бы разбирать обратно с учётом того, какая в таблице локаль.
-        """
-        try:
-            values = (
-                self.sheets.values()
-                .get(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=self._range(f"A2:{LAST_COLUMN}"),
+                    range=self._range(f"A:{last}"),
                     valueRenderOption="UNFORMATTED_VALUE",
                 )
                 .execute()
                 .get("values", [])
             )
         except HttpError as exc:
-            raise SheetsError(f"Не удалось прочитать таблицу: {exc}") from exc
-        return values
+            log.warning("Не удалось прочитать таблицу (%s) — считаю её пустой", exc)
+            return {}
 
-    def append_rows(self, rows: Sequence[Sequence[Any]]) -> int:
-        """Дописываем строки в конец листа одним запросом.
+        if not values:
+            return {}
 
-        valueInputOption=USER_ENTERED — Google сам распознает числа и даты,
-        так что количество и суммы будут именно числами, а не текстом.
-        insertDataOption=INSERT_ROWS — вставка новых строк, а не перезапись
-        того, что может лежать ниже таблицы.
+        by_branch: dict = {}
+        # Блоков может быть больше трёх, если в кассе появится новый филиал.
+        block_count = (max(len(row) for row in values) + BLOCK_STEP - 1) // BLOCK_STEP
+        for index in range(max(block_count, 1)):
+            start_col = index * BLOCK_STEP
+
+            def cell(row_index: int, offset: int = 0):
+                if row_index >= len(values):
+                    return ""
+                row = values[row_index]
+                position = start_col + offset
+                return row[position] if position < len(row) else ""
+
+            branch = str(cell(0)).strip()
+            if not branch:
+                continue
+
+            rows = []
+            for row_index in range(2, len(values)):      # строки 1 и 2 — название и шапка
+                first = str(cell(row_index)).strip()
+                if not first or first.upper().startswith("ИТОГО"):
+                    break
+                rows.append([cell(row_index, offset) for offset in range(BLOCK_WIDTH)])
+            by_branch[branch] = rows
+        return by_branch
+
+    def existing_sale_ids(self) -> set:
+        """Собираем ID уже записанных продаж из всех блоков.
+
+        Это вторая линия защиты от дублей: даже если файл state.json
+        потеряли, скрипт видит по таблице, что уже записано.
         """
-        if not rows:
-            return 0
+        ids = set()
+        for rows in self.read_branch_blocks().values():
+            for row in rows:
+                sale_id = str(row[BLOCK_WIDTH - 1]).strip()
+                if sale_id:
+                    ids.add(sale_id)
+        log.info("В таблице уже записано продаж: %d", len(ids))
+        return ids
+
+    def write_branch_blocks(self, by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> None:
+        """Записываем все блоки заново — целиком, а не дозаписью.
+
+        Почему не append: строка ИТОГО стоит сразу под последней продажей
+        своего блока, а у филиалов разное число продаж. Дозапись положила бы
+        новые строки под ИТОГО и раскладка поехала бы.
+        """
+        branches = [b for b in sorted(by_branch, key=branch_sort_key)]
+        if not branches:
+            return
+
+        blocks: List[List[List[Any]]] = []
+        for branch in branches:
+            rows = [list(r) for r in by_branch[branch]]
+            quantity = sum(_to_number(r[2]) for r in rows if len(r) > 2)
+            total = sum(_to_number(r[4]) for r in rows if len(r) > 4)
+
+            block = [[branch], list(BRANCH_HEADER)]
+            block.extend(rows)
+            # Строка ИТОГО идёт сразу после последней продажи, без отступа:
+            # «ИТОГО» в первой колонке, количество и сумма — в своих.
+            block.append(["ИТОГО", "", quantity, "", total, ""])
+            blocks.append(block)
+
+        height = max(len(b) for b in blocks)
+        width = (len(blocks) - 1) * BLOCK_STEP + BLOCK_WIDTH
+        grid: List[List[Any]] = [["" for _ in range(width)] for _ in range(height)]
+        for index, block in enumerate(blocks):
+            start_col = index * BLOCK_STEP
+            for row_index, row in enumerate(block):
+                for offset, value in enumerate(row):
+                    grid[row_index][start_col + offset] = value
+
+        last = column_letter(width + 1)
         try:
-            response = (
-                self.sheets.values()
-                .append(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=self._range(f"A:{LAST_COLUMN}"),
-                    valueInputOption="USER_ENTERED",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": [list(r) for r in rows]},
-                )
-                .execute()
-            )
+            # Чистим весь диапазон: у филиала могло стать меньше продаж,
+            # и от прошлого запуска остались бы хвосты.
+            self.sheets.values().clear(
+                spreadsheetId=self.spreadsheet_id,
+                range=self._range(f"A:{last}"),
+                body={},
+            ).execute()
+            self.sheets.values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=self._range("A1"),
+                valueInputOption="USER_ENTERED",
+                body={"values": grid},
+            ).execute()
+            self._apply_block_formats(len(blocks))
         except HttpError as exc:
-            raise SheetsError(f"Не удалось записать строки в таблицу: {exc}") from exc
+            raise SheetsError(f"Не удалось записать блоки филиалов: {exc}") from exc
 
-        updated = response.get("updates", {}).get("updatedRows", len(rows))
-        log.info("В таблицу дописано строк: %s", updated)
+        for branch, block in zip(branches, blocks):
+            log.info("Блок «%s»: продаж %d", branch, len(block) - 3)
 
-        # Формат колонок задаём именно здесь, а не только при создании листа:
-        # append дописывает строки НИЖЕ той области, к которой формат уже
-        # применялся, и свежие ячейки достаются без него — тогда дата
-        # показывается числом вида 46238,5587 вместо 30.08.2026 13:24:31.
-        if self._sheet_id is not None:
-            self._apply_column_formats(self._sheet_id)
-
-        return int(updated)
+    def _apply_block_formats(self, block_count: int) -> None:
+        """Формат колонок в каждом блоке: дата — датой, ID — текстом."""
+        if self._sheet_id is None:
+            return
+        requests = []
+        for index in range(block_count):
+            start_col = index * BLOCK_STEP
+            for offset, fmt in (
+                (0, {"type": "DATE_TIME", "pattern": "dd.mm.yyyy hh:mm:ss"}),
+                (BLOCK_WIDTH - 1, {"type": "TEXT"}),
+            ):
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": self._sheet_id,
+                            "startRowIndex": 2,      # ниже названия филиала и шапки
+                            "startColumnIndex": start_col + offset,
+                            "endColumnIndex": start_col + offset + 1,
+                        },
+                        "cell": {"userEnteredFormat": {"numberFormat": fmt}},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
+        try:
+            self.sheets.batchUpdate(
+                spreadsheetId=self.spreadsheet_id, body={"requests": requests}
+            ).execute()
+        except HttpError as exc:
+            log.warning("Не удалось задать формат колонок (%s) — продолжаю", exc)
 
     # ------------------------------------------------------------------
     # Отдельный лист под каждый филиал
     # ------------------------------------------------------------------
-
-    def write_branch_sheets(self, by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> None:
-        """Раскладываем продажи по отдельным листам — по листу на филиал.
-
-        Каждый лист переписывается целиком: шапка, строки продаж, пустая
-        строка и итог внизу. Почему не дозапись, как в общем листе: итоговая
-        строка стоит последней, и append положил бы новые продажи ПОСЛЕ неё.
-        Данные для перезаписи берутся из общего листа «Продажи», так что
-        потерять их нельзя — он остаётся первоисточником.
-        """
-        for branch in sorted(by_branch, key=branch_sort_key):
-            rows = list(by_branch[branch])
-            sheet_id = self._ensure_sheet_exists(branch)
-
-            quantity = sum(_to_number(r[2]) for r in rows if len(r) > 2)
-            total = sum(_to_number(r[4]) for r in rows if len(r) > 4)
-            receipts = len({str(r[5]) for r in rows if len(r) > 5 and str(r[5]).strip()})
-
-            values: List[List[Any]] = [BRANCH_HEADER]
-            values.extend(list(r) for r in rows)
-            values.append([])                      # пустая строка перед итогом
-            values.append(["ИТОГО", f"чеков: {receipts}", quantity, "", total, ""])
-
-            try:
-                self.sheets.values().clear(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=self._range("A:F", branch),
-                    body={},
-                ).execute()
-                self.sheets.values().update(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=self._range("A1", branch),
-                    valueInputOption="USER_ENTERED",
-                    body={"values": values},
-                ).execute()
-                # На листе филиала ID продажи лежит в колонке F (индекс 5).
-                self._apply_column_formats(sheet_id, date_column=0, text_column=5)
-            except HttpError as exc:
-                raise SheetsError(f"Не удалось записать лист «{branch}»: {exc}") from exc
-
-            log.info(
-                "Лист «%s»: строк %d, итого %s шт на %s тг",
-                branch, len(rows), quantity, total,
-            )
 
     # ------------------------------------------------------------------
     # Сводка по филиалам

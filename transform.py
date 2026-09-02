@@ -58,6 +58,18 @@ class SaleRow:
     total: float        # Сумма = количество * цена
     sale_id: str        # ID продажи (по нему отсекаем дубликаты)
 
+    def as_block_row(self) -> List[Any]:
+        """Строка для блока филиала: колонка «Филиал» там не нужна —
+        весь блок и так про одну точку."""
+        return [
+            self.sold_at,
+            self.title,
+            self.quantity,
+            self.unit_price,
+            self.total,
+            self.sale_id,
+        ]
+
     def as_sheet_row(self) -> List[Any]:
         """Порядок значений строго как порядок колонок в таблице."""
         return [
@@ -274,69 +286,50 @@ def branch_sort_key(branch: str) -> tuple:
     return (0, 0, branch.casefold())
 
 
-def build_branch_summary(sheet_rows: Sequence[Sequence[Any]]) -> dict:
-    """Считаем итоги по филиалам на основе строк, уже лежащих в таблице.
+def build_branch_summary(by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> dict:
+    """Считаем итоги по филиалам на основе блоков, прочитанных из таблицы.
 
-    Каждая строка таблицы устроена так:
-        [дата, филиал, товар, количество, цена, сумма, ID продажи]
+    Строка блока устроена так:
+        [дата, товар, количество, цена, сумма, ID продажи]
 
-    Возвращаем словарь:
-        {"2 точка": {"quantity": 10.0, "total": 119358.0, "receipts": 9}}
-
-    Чеки считаем по уникальным ID продаж: в одном чеке товар может
-    встречаться несколькими строками, а чек при этом один.
+    Возвращаем {"2 точка": {"quantity": 27.0, "total": 317358.02, "receipts": 24}}.
+    Чеки считаем по уникальным ID: в одном чеке товар может встретиться
+    несколькими строками, но чек при этом один.
     """
     summary: dict = {}
-    receipts: dict = {}
-
-    for row in sheet_rows:
-        if len(row) < 6:
-            continue                      # незаполненная строка — пропускаем
-        branch = str(row[1]).strip() or "Без филиала"
-        quantity = _to_float(row[3])
-        total = _to_float(row[5])
-        sale_id = str(row[6]).strip() if len(row) > 6 else ""
-
-        data = summary.setdefault(branch, {"quantity": 0.0, "total": 0.0, "receipts": 0})
-        data["quantity"] += quantity
-        data["total"] += total
-        receipts.setdefault(branch, set()).add(sale_id)
-
-    for branch, ids in receipts.items():
-        summary[branch]["receipts"] = len(ids - {""})
-
-    # Округляем, чтобы в таблице не появлялись хвосты вида 37.99999999
-    for data in summary.values():
-        data["quantity"] = round(data["quantity"], 3)
-        data["total"] = round(data["total"], 2)
+    for branch, rows in by_branch.items():
+        quantity = total = 0.0
+        receipts = set()
+        for row in rows:
+            if len(row) < 5:
+                continue
+            quantity += _to_float(row[2])
+            total += _to_float(row[4])
+            sale_id = str(row[5]).strip() if len(row) > 5 else ""
+            if sale_id:
+                receipts.add(sale_id)
+        summary[branch] = {
+            "quantity": round(quantity, 3),
+            "total": round(total, 2),
+            "receipts": len(receipts),
+        }
     return summary
 
 
-def split_rows_by_branch(sheet_rows: Sequence[Sequence[Any]]) -> dict:
-    """Раскладываем строки общего листа по филиалам.
+def sale_row_sort_key(row: Sequence[Any]) -> tuple:
+    """Порядок строк внутри блока — хронологический.
 
-    На вход идут строки листа «Продажи»:
-        [дата, филиал, товар, количество, цена, сумма, ID продажи]
-
-    На выходе — словарь «филиал → список строк», причём колонку с филиалом
-    из строк убираем: на его собственном листе она не нужна, там и так
-    всё про один филиал.
-
-    Строки внутри филиала идут по дате, старые сверху.
+    Сортируем по ID продажи: он выдаётся кассой по возрастанию, поэтому
+    работает как надёжная замена дате. Саму дату для этого использовать
+    неудобно: у прочитанных из таблицы строк она приходит числом Google,
+    а у новых — строкой «03.09.2026 01:20:00», и сравнивать их пришлось бы
+    через разбор формата.
     """
-    by_branch: dict = {}
-    for row in sheet_rows:
-        if len(row) < 6:
-            continue
-        branch = str(row[1]).strip() or "Без филиала"
-        without_branch = [row[0]] + list(row[2:])
-        by_branch.setdefault(branch, []).append(without_branch)
-
-    # Сортируем по дате. В таблице дата хранится числом (дни с 30.12.1899),
-    # поэтому обычное сравнение чисел даёт правильный хронологический порядок.
-    for rows in by_branch.values():
-        rows.sort(key=lambda r: (_to_float(r[0]), str(r[-1])))
-    return by_branch
+    sale_id = str(row[5]).strip() if len(row) > 5 else ""
+    try:
+        return (0, int(sale_id), "")
+    except ValueError:
+        return (1, 0, sale_id)
 
 
 def sale_sort_key(sale: Mapping[str, Any]) -> tuple:

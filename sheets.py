@@ -21,6 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import Config
+from transform import branch_sort_key
 
 log = logging.getLogger(__name__)
 
@@ -310,10 +311,9 @@ class SheetsWriter:
         total_sum = 0.0
         total_receipts = 0
 
-        # Филиалы по убыванию количества: самый продающий сверху.
-        for branch, data in sorted(
-            by_branch.items(), key=lambda kv: kv[1]["quantity"], reverse=True
-        ):
+        # Порядок филиалов постоянный (см. branch_sort_key), чтобы строки
+        # не прыгали от запуска к запуску и цифры было удобно сравнивать.
+        for branch, data in sorted(by_branch.items(), key=lambda kv: branch_sort_key(kv[0])):
             rows.append([branch])
             rows.append(["Количество, шт", data["quantity"]])
             rows.append(["Сумма, тг", data["total"]])

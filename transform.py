@@ -19,6 +19,7 @@ transform.py — превращаем JSON одной продажи в стро
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Mapping, Optional, Sequence
@@ -252,6 +253,25 @@ def sales_to_rows(
     for sale in sales:
         rows.extend(sale_to_rows(sale, item_titles, tz, item_filter))
     return rows
+
+
+def branch_sort_key(branch: str) -> tuple:
+    """Ключ сортировки филиалов — всегда один и тот же порядок.
+
+    Обычная сортировка по алфавиту поставила бы «2 точка» и «3 точка»
+    впереди «Основного склада», потому что цифры идут раньше букв.
+    Поэтому сортируем «естественно»:
+      1. филиалы без номера в названии (Основной склад) — первыми;
+      2. остальные — по возрастанию номера: 2 точка, 3 точка, 10 точка.
+
+    Порядок не зависит от того, где больше продали, поэтому строки
+    в сводке всегда стоят на своих местах и их удобно сравнивать
+    день ото дня.
+    """
+    match = re.search(r"\d+", branch)
+    if match:
+        return (1, int(match.group()), branch.casefold())
+    return (0, 0, branch.casefold())
 
 
 def build_branch_summary(sheet_rows: Sequence[Sequence[Any]]) -> dict:

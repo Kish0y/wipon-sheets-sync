@@ -39,12 +39,18 @@ ITEMS_FIELDS = ("item_sale", "items", "item_sales", "sale_items")
 # Где может лежать название товара внутри позиции чека.
 TITLE_FIELDS = ("title", "quick_title", "item_title", "name")
 
+# Где искать филиал (точку продажи). В боевом ответе это объект stock:
+#   "stock": {"id": 69602, "name": "2 точка", ...}
+# Если его вдруг не окажется, пробуем кассу — она тоже привязана к точке.
+BRANCH_SOURCES = ("stock", "cashbox")
+
 
 @dataclass
 class SaleRow:
     """Одна строка будущей таблицы."""
 
     sold_at: str        # Дата и время продажи (строка, уже в нужном часовом поясе)
+    branch: str         # Филиал (точка продажи)
     title: str          # Название товара
     quantity: float     # Количество
     unit_price: float   # Цена за единицу
@@ -53,7 +59,15 @@ class SaleRow:
 
     def as_sheet_row(self) -> List[Any]:
         """Порядок значений строго как порядок колонок в таблице."""
-        return [self.sold_at, self.title, self.quantity, self.unit_price, self.total, self.sale_id]
+        return [
+            self.sold_at,
+            self.branch,
+            self.title,
+            self.quantity,
+            self.unit_price,
+            self.total,
+            self.sale_id,
+        ]
 
 
 def _to_float(value: Any) -> float:
@@ -150,18 +164,39 @@ def _resolve_title(position: Mapping[str, Any], item_titles: Mapping[str, str]) 
     return f"Товар #{item_id}" if item_id is not None else "Товар без названия"
 
 
+def resolve_branch(sale: Mapping[str, Any]) -> str:
+    """Достаём название филиала из продажи.
+
+    В ответе API филиал лежит в объекте stock («склад» в терминах Wipon,
+    но фактически это торговая точка): stock.name = «2 точка».
+    """
+    for source in BRANCH_SOURCES:
+        nested = sale.get(source)
+        if isinstance(nested, dict):
+            name = nested.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return "Без филиала"
+
+
 def sale_to_rows(
     sale: Mapping[str, Any],
     item_titles: Mapping[str, str],
     tz: ZoneInfo,
+    item_filter: Sequence[str] = (),
 ) -> List[SaleRow]:
-    """Разбираем одну продажу на строки таблицы (по строке на товар)."""
+    """Разбираем одну продажу на строки таблицы (по строке на товар).
+
+    item_filter — список названий товаров, которые нас интересуют.
+    Пустой список означает «берём все товары».
+    """
     sale_id = sale.get("id")
     if sale_id is None:
         log.warning("Пропускаю продажу без поля id: %.200s", sale)
         return []
 
     sold_at = format_datetime(_first_present(sale, DATE_FIELDS), tz)
+    branch = resolve_branch(sale)
 
     positions = _first_present(sale, ITEMS_FIELDS)
     if not isinstance(positions, list) or not positions:
@@ -171,6 +206,15 @@ def sale_to_rows(
     rows: List[SaleRow] = []
     for position in positions:
         if not isinstance(position, dict):
+            continue
+
+        title = _resolve_title(position, item_titles)
+
+        # Фильтр по названию товара. Сравниваем без учёта регистра и
+        # лишних пробелов, чтобы «магний 3x nurelum» тоже находился.
+        if item_filter and title.casefold().strip() not in {
+            wanted.casefold().strip() for wanted in item_filter
+        }:
             continue
 
         quantity = _to_float(_first_present(position, ("quantity",)))
@@ -185,7 +229,8 @@ def sale_to_rows(
         rows.append(
             SaleRow(
                 sold_at=sold_at,
-                title=_resolve_title(position, item_titles),
+                branch=branch,
+                title=title,
                 quantity=quantity,
                 unit_price=unit_price,
                 total=total,
@@ -200,12 +245,51 @@ def sales_to_rows(
     sales: Sequence[Mapping[str, Any]],
     item_titles: Mapping[str, str],
     tz: ZoneInfo,
+    item_filter: Sequence[str] = (),
 ) -> List[SaleRow]:
     """Разбираем список продаж, сортируя итог по дате (старые продажи выше)."""
     rows: List[SaleRow] = []
     for sale in sales:
-        rows.extend(sale_to_rows(sale, item_titles, tz))
+        rows.extend(sale_to_rows(sale, item_titles, tz, item_filter))
     return rows
+
+
+def build_branch_summary(sheet_rows: Sequence[Sequence[Any]]) -> dict:
+    """Считаем итоги по филиалам на основе строк, уже лежащих в таблице.
+
+    Каждая строка таблицы устроена так:
+        [дата, филиал, товар, количество, цена, сумма, ID продажи]
+
+    Возвращаем словарь:
+        {"2 точка": {"quantity": 10.0, "total": 119358.0, "receipts": 9}}
+
+    Чеки считаем по уникальным ID продаж: в одном чеке товар может
+    встречаться несколькими строками, а чек при этом один.
+    """
+    summary: dict = {}
+    receipts: dict = {}
+
+    for row in sheet_rows:
+        if len(row) < 6:
+            continue                      # незаполненная строка — пропускаем
+        branch = str(row[1]).strip() or "Без филиала"
+        quantity = _to_float(row[3])
+        total = _to_float(row[5])
+        sale_id = str(row[6]).strip() if len(row) > 6 else ""
+
+        data = summary.setdefault(branch, {"quantity": 0.0, "total": 0.0, "receipts": 0})
+        data["quantity"] += quantity
+        data["total"] += total
+        receipts.setdefault(branch, set()).add(sale_id)
+
+    for branch, ids in receipts.items():
+        summary[branch]["receipts"] = len(ids - {""})
+
+    # Округляем, чтобы в таблице не появлялись хвосты вида 37.99999999
+    for data in summary.values():
+        data["quantity"] = round(data["quantity"], 3)
+        data["total"] = round(data["total"], 2)
+    return summary
 
 
 def sale_sort_key(sale: Mapping[str, Any]) -> tuple:

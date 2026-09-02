@@ -82,6 +82,23 @@ class Config:
     spreadsheet_id: str = field(default_factory=lambda: _env_str("GOOGLE_SPREADSHEET_ID"))
     sheet_name: str = field(default_factory=lambda: _env_str("GOOGLE_SHEET_NAME", "Продажи"))
 
+    # Лист со сводкой по филиалам. Перезаписывается при каждом запуске.
+    summary_sheet_name: str = field(
+        default_factory=lambda: _env_str("GOOGLE_SUMMARY_SHEET_NAME", "Сводка")
+    )
+
+    # --- Фильтр товаров ---
+    # Список названий через точку с запятой: в таблицу попадут только они.
+    # Пустая строка означает «писать все товары».
+    # Пример: ITEM_FILTER=Магний 3x Nurelum;Омега 1000 мг 100 капсул
+    item_filter: tuple = field(
+        default_factory=lambda: tuple(
+            name.strip()
+            for name in _env_str("ITEM_FILTER").split(";")
+            if name.strip()
+        )
+    )
+
     # --- Логика синхронизации ---
     # За сколько дней назад тянуть продажи при самом первом запуске
     # (когда файла состояния ещё нет).

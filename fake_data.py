@@ -30,6 +30,16 @@ FAKE_ITEMS: List[Dict[str, Any]] = [
     {"id": 3, "title": "Молоко 2.5% 1 л", "barcode": "4870004303456", "selling_price": "590.00"},
     {"id": 4, "title": "Шоколад молочный 90 г", "barcode": "4870004304567", "selling_price": "780.00"},
     {"id": 5, "title": "Пакет-майка", "barcode": "4870004305678", "selling_price": "30.00"},
+    # Реальное название из ассортимента магазина — чтобы на фейковых данных
+    # можно было проверить фильтр ITEM_FILTER.
+    {"id": 6, "title": "Магний 3x Nurelum", "barcode": "8680512628408", "selling_price": "12000.00"},
+]
+
+# Филиалы (в терминах API — склады). Настоящих в кассе три.
+FAKE_BRANCHES = [
+    {"id": 67854, "name": "Основной склад"},
+    {"id": 69602, "name": "2 точка"},
+    {"id": 73184, "name": "3 точка"},
 ]
 
 
@@ -58,24 +68,33 @@ def fake_sales(tz: ZoneInfo, count: int = 4, seed: int | None = None) -> List[Di
         # Раскидываем чеки по времени: самый старый — раньше всех.
         sold_at = now - timedelta(minutes=(count - n) * 7)
 
+        # Структура повторяет боевой ответ Wipon: позиции лежат в item_sale,
+        # название товара — во вложенном объекте item.
         positions = []
         for item in rnd.sample(FAKE_ITEMS, rnd.randint(1, 3)):
             quantity = rnd.choice([1, 1, 2, 3, 5])
             positions.append(
                 {
-                    "item_id": item["id"],
-                    "title": item["title"],
-                    "barcode": item["barcode"],
+                    "id": rnd.randint(700000000, 799999999),
                     "quantity": f"{quantity}.000",
                     "selling_price": item["selling_price"],
+                    "price": item["selling_price"],
+                    "item": {
+                        "id": item["id"],
+                        "title": item["title"],
+                        "barcode": item["barcode"],
+                        "selling_price": item["selling_price"],
+                    },
                 }
             )
 
+        branch = rnd.choice(FAKE_BRANCHES)
         sales.append(
             {
                 "id": f"TEST-{batch}-{n}",
-                "created_at": sold_at.isoformat(),
-                "items": positions,
+                "created_at": sold_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "stock": branch,
+                "item_sale": positions,
             }
         )
 

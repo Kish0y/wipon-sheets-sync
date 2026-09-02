@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from config import Config, ConfigError
 from state import SyncState
-from transform import SaleRow, sale_sort_key, sales_to_rows
+from transform import build_branch_summary, SaleRow, sale_sort_key, sales_to_rows
 
 log = logging.getLogger("wipon_sync")
 
@@ -217,11 +217,15 @@ def filter_new_sales(sales: Sequence[Mapping[str, Any]], state: SyncState) -> Li
 def print_rows(rows: Sequence[SaleRow]) -> None:
     """Показываем строки в консоли (режим --dry-run)."""
     print("\n--- Строки, которые были бы записаны в таблицу ---")
-    print(f"{'Дата и время':<21}{'Товар':<32}{'Кол-во':>8}{'Цена':>10}{'Сумма':>11}  ID")
+    print(
+        f"{'Дата и время':<21}{'Филиал':<17}{'Товар':<32}"
+        f"{'Кол-во':>8}{'Цена':>10}{'Сумма':>11}  ID"
+    )
     for row in rows:
         title = row.title if len(row.title) <= 30 else row.title[:29] + "…"
+        branch = row.branch if len(row.branch) <= 15 else row.branch[:14] + "…"
         print(
-            f"{row.sold_at:<21}{title:<32}{row.quantity:>8.3f}"
+            f"{row.sold_at:<21}{branch:<17}{title:<32}{row.quantity:>8.3f}"
             f"{row.unit_price:>10.2f}{row.total:>11.2f}  {row.sale_id}"
         )
     print(f"--- Итого строк: {len(rows)} ---\n")
@@ -230,6 +234,28 @@ def print_rows(rows: Sequence[SaleRow]) -> None:
 # ----------------------------------------------------------------------
 # БЛОК 5. Основной сценарий
 # ----------------------------------------------------------------------
+
+def update_summary(cfg: Config, tz) -> None:
+    """Пересчитываем лист «Сводка» по тому, что уже лежит в таблице.
+
+    Считаем именно по таблице, а не по свежей порции продаж: иначе после
+    запуска, в котором не было новых чеков, сводка обнулилась бы.
+    Ошибку сюда не пропускаем наверх — сводка это витрина, из-за неё
+    не должен падать весь запуск, продажи уже записаны.
+    """
+    from sheets import SheetsWriter
+
+    try:
+        writer = SheetsWriter(cfg)
+        summary = build_branch_summary(writer.read_data_rows())
+        writer.write_summary(
+            cfg.item_filter,
+            summary,
+            datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S"),
+        )
+    except Exception as exc:                      # noqa: BLE001
+        log.warning("Не удалось обновить сводку по филиалам: %s", exc)
+
 
 def run(args) -> int:
     """Один цикл синхронизации. Возвращает код возврата процесса."""
@@ -260,10 +286,12 @@ def run(args) -> int:
         log.info("Все полученные продажи уже были записаны раньше. Новых строк: 0")
         state.last_sync_at = started_at
         state.save()
+        if not args.dry_run:
+            update_summary(cfg, tz)
         return 0
 
     # --- Шаг 3: превращаем продажи в строки таблицы ---
-    rows = sales_to_rows(sales, item_titles, tz)
+    rows = sales_to_rows(sales, item_titles, tz, cfg.item_filter)
     log.info("Готово к записи: %d продаж -> %d строк", len(sales), len(rows))
 
     if args.dry_run:
@@ -282,11 +310,12 @@ def run(args) -> int:
     if cfg.reconcile_with_sheet:
         state.add_known_ids(writer.existing_sale_ids())
         sales = sorted(filter_new_sales(sales, state), key=sale_sort_key)
-        rows = sales_to_rows(sales, item_titles, tz)
+        rows = sales_to_rows(sales, item_titles, tz, cfg.item_filter)
         if not rows:
             log.info("После сверки с таблицей новых строк не осталось")
             state.last_sync_at = started_at
             state.save()
+            update_summary(cfg, tz)
             return 0
 
     written = writer.append_rows([r.as_sheet_row() for r in rows])
@@ -297,6 +326,9 @@ def run(args) -> int:
     state.mark_processed(str(s["id"]) for s in sales)
     state.last_sync_at = started_at
     state.save()
+
+    # --- Шаг 6: пересчитываем сводку по филиалам ---
+    update_summary(cfg, tz)
 
     log.info(
         "ИТОГ: обработано продаж %d, записано строк %d, последний ID продажи %s",

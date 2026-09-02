@@ -14,7 +14,7 @@ sheets.py — запись строк в Google Таблицу через servic
 """
 
 import logging
-from typing import Any, Sequence
+from typing import Any, List, Mapping, Sequence
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 # Заголовки колонок — ровно в том порядке, в котором формируются строки.
 HEADER = [
     "Дата и время продажи",
+    "Филиал",
     "Название товара",
     "Количество",
     "Цена за единицу",
@@ -37,8 +38,12 @@ HEADER = [
 # Разрешение только на работу с таблицами.
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Колонка F — «ID продажи». По ней проверяем, что уже записано.
-SALE_ID_COLUMN = "F"
+# Колонка G — «ID продажи». По ней проверяем, что уже записано.
+# (была F, сдвинулась вправо после добавления колонки «Филиал»)
+SALE_ID_COLUMN = "G"
+
+# Последняя колонка таблицы — нужна для диапазонов вида A1:G1.
+LAST_COLUMN = "G"
 
 
 class SheetsError(Exception):
@@ -69,10 +74,32 @@ class SheetsWriter:
         self.sheets = self.service.spreadsheets()
         self.spreadsheet_id = cfg.spreadsheet_id
         self.sheet_name = cfg.sheet_name
+        self.summary_sheet_name = cfg.summary_sheet_name
+        # sheetId основного листа. Заполняется в ensure_sheet_and_header
+        # и нужен, чтобы задать формат колонок после дозаписи строк.
+        self._sheet_id = None
 
-    def _range(self, a1: str) -> str:
-        """Собираем полный диапазон вида 'Продажи'!A1:F1."""
-        return f"{_quote_sheet_name(self.sheet_name)}!{a1}"
+    def _range(self, a1: str, sheet: str = "") -> str:
+        """Собираем полный диапазон вида 'Продажи'!A1:G1.
+
+        sheet — имя листа; по умолчанию основной лист с продажами.
+        """
+        return f"{_quote_sheet_name(sheet or self.sheet_name)}!{a1}"
+
+    def _ensure_sheet_exists(self, title: str) -> int:
+        """Создаём лист, если его ещё нет. Возвращаем его числовой sheetId."""
+        meta = self.sheets.get(spreadsheetId=self.spreadsheet_id).execute()
+        for sheet in meta.get("sheets", []):
+            props = sheet["properties"]
+            if props["title"] == title:
+                return props["sheetId"]
+
+        log.info("Лист «%s» не найден — создаю", title)
+        response = self.sheets.batchUpdate(
+            spreadsheetId=self.spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+        ).execute()
+        return response["replies"][0]["addSheet"]["properties"]["sheetId"]
 
     # ------------------------------------------------------------------
     # Подготовка таблицы
@@ -109,7 +136,7 @@ class SheetsWriter:
         # Читаем первую строку. Если пусто — записываем заголовки.
         first_row = (
             self.sheets.values()
-            .get(spreadsheetId=self.spreadsheet_id, range=self._range("A1:F1"))
+            .get(spreadsheetId=self.spreadsheet_id, range=self._range(f"A1:{LAST_COLUMN}1"))
             .execute()
             .get("values", [])
         )
@@ -117,11 +144,12 @@ class SheetsWriter:
             log.info("Записываю строку заголовков")
             self.sheets.values().update(
                 spreadsheetId=self.spreadsheet_id,
-                range=self._range("A1:F1"),
+                range=self._range(f"A1:{LAST_COLUMN}1"),
                 valueInputOption="USER_ENTERED",
                 body={"values": [HEADER]},
             ).execute()
 
+        self._sheet_id = sheet_id
         self._apply_column_formats(sheet_id)
 
     def _apply_column_formats(self, sheet_id: int) -> None:
@@ -153,8 +181,8 @@ class SheetsWriter:
         requests = [
             # A — «Дата и время продажи»
             column_format(0, 1, {"type": "DATE_TIME", "pattern": "dd.mm.yyyy hh:mm:ss"}),
-            # F — «ID продажи», строго текстом
-            column_format(5, 6, {"type": "TEXT"}),
+            # G — «ID продажи», строго текстом
+            column_format(6, 7, {"type": "TEXT"}),
         ]
         try:
             self.sheets.batchUpdate(
@@ -192,6 +220,28 @@ class SheetsWriter:
         log.info("В таблице уже записано продаж: %d", len(ids))
         return ids
 
+    def read_data_rows(self) -> List[List[Any]]:
+        """Читаем все строки листа продаж без шапки.
+
+        valueRenderOption=UNFORMATTED_VALUE — просим Google вернуть «сырые»
+        значения: числа числами, а не строкой «1 234,50», иначе их пришлось
+        бы разбирать обратно с учётом того, какая в таблице локаль.
+        """
+        try:
+            values = (
+                self.sheets.values()
+                .get(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=self._range(f"A2:{LAST_COLUMN}"),
+                    valueRenderOption="UNFORMATTED_VALUE",
+                )
+                .execute()
+                .get("values", [])
+            )
+        except HttpError as exc:
+            raise SheetsError(f"Не удалось прочитать таблицу: {exc}") from exc
+        return values
+
     def append_rows(self, rows: Sequence[Sequence[Any]]) -> int:
         """Дописываем строки в конец листа одним запросом.
 
@@ -207,7 +257,7 @@ class SheetsWriter:
                 self.sheets.values()
                 .append(
                     spreadsheetId=self.spreadsheet_id,
-                    range=self._range("A:F"),
+                    range=self._range(f"A:{LAST_COLUMN}"),
                     valueInputOption="USER_ENTERED",
                     insertDataOption="INSERT_ROWS",
                     body={"values": [list(r) for r in rows]},
@@ -219,4 +269,82 @@ class SheetsWriter:
 
         updated = response.get("updates", {}).get("updatedRows", len(rows))
         log.info("В таблицу дописано строк: %s", updated)
+
+        # Формат колонок задаём именно здесь, а не только при создании листа:
+        # append дописывает строки НИЖЕ той области, к которой формат уже
+        # применялся, и свежие ячейки достаются без него — тогда дата
+        # показывается числом вида 46238,5587 вместо 30.08.2026 13:24:31.
+        if self._sheet_id is not None:
+            self._apply_column_formats(self._sheet_id)
+
         return int(updated)
+
+    # ------------------------------------------------------------------
+    # Сводка по филиалам
+    # ------------------------------------------------------------------
+
+    def write_summary(
+        self,
+        item_names: Sequence[str],
+        by_branch: Mapping[str, Mapping[str, Any]],
+        generated_at: str,
+    ) -> None:
+        """Перезаписываем лист со сводкой: по блоку на каждый филиал.
+
+        by_branch — словарь вида
+            {"2 точка": {"quantity": 10, "total": 119358, "receipts": 9}, ...}
+
+        Лист каждый раз переписывается заново, а не дополняется: сводка
+        показывает текущее состояние, накапливать в ней нечего.
+        """
+        self._ensure_sheet_exists(self.summary_sheet_name)
+
+        title = ", ".join(item_names) if item_names else "все товары"
+        rows: List[List[Any]] = [
+            ["Сводка по товару:", title],
+            ["Обновлено:", generated_at],
+            [],
+        ]
+
+        total_quantity = 0.0
+        total_sum = 0.0
+        total_receipts = 0
+
+        # Филиалы по убыванию количества: самый продающий сверху.
+        for branch, data in sorted(
+            by_branch.items(), key=lambda kv: kv[1]["quantity"], reverse=True
+        ):
+            rows.append([branch])
+            rows.append(["Количество, шт", data["quantity"]])
+            rows.append(["Сумма, тг", data["total"]])
+            rows.append(["Чеков", data["receipts"]])
+            rows.append([])          # пустая строка между филиалами
+            total_quantity += data["quantity"]
+            total_sum += data["total"]
+            total_receipts += data["receipts"]
+
+        rows.append(["ИТОГО ПО ВСЕМ ФИЛИАЛАМ"])
+        rows.append(["Количество, шт", total_quantity])
+        rows.append(["Сумма, тг", total_sum])
+        rows.append(["Чеков", total_receipts])
+
+        target = self._range("A:D", self.summary_sheet_name)
+        try:
+            # Сначала стираем старую сводку, иначе от прошлого запуска
+            # могут остаться строки, если филиалов стало меньше.
+            self.sheets.values().clear(
+                spreadsheetId=self.spreadsheet_id, range=target, body={}
+            ).execute()
+            self.sheets.values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=self._range("A1", self.summary_sheet_name),
+                valueInputOption="USER_ENTERED",
+                body={"values": rows},
+            ).execute()
+        except HttpError as exc:
+            raise SheetsError(f"Не удалось записать сводку: {exc}") from exc
+
+        log.info(
+            "Сводка обновлена: филиалов %d, всего %s шт на %s тг",
+            len(by_branch), total_quantity, total_sum,
+        )

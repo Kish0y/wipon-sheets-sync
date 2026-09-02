@@ -99,6 +99,10 @@ jobs:
           # --- обычные настройки, их прятать незачем ---
           GOOGLE_CREDENTIALS_FILE: service_account.json
           GOOGLE_SHEET_NAME: Продажи
+          GOOGLE_SUMMARY_SHEET_NAME: Сводка
+          # Какие товары писать в таблицу. Несколько — через точку с запятой.
+          # Пустая строка означала бы «все товары».
+          ITEM_FILTER: Магний 3x Nurelum
           TIMEZONE: Asia/Almaty
           # Машина GitHub одноразовая: файла state.json на ней нет,
           # поэтому от дублей защищаемся сверкой с колонкой ID в таблице.

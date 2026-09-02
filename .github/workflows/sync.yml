@@ -38,12 +38,56 @@ jobs:
       - name: Установить зависимости
         run: pip install --quiet -r requirements.txt
 
+      - name: Проверить, что все секреты заданы
+        # Без этой проверки скрипт падает с кодом 2 и невнятным сообщением.
+        # Здесь мы заранее говорим, КАКОГО именно секрета не хватает.
+        # Сами значения не печатаем — только имена.
+        env:
+          WIPON_USERNAME: ${{ secrets.WIPON_USERNAME }}
+          WIPON_PASSWORD: ${{ secrets.WIPON_PASSWORD }}
+          WIPON_EMPLOYEE_ID: ${{ secrets.WIPON_EMPLOYEE_ID }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          missing=""
+          for name in WIPON_USERNAME WIPON_PASSWORD WIPON_EMPLOYEE_ID                       GOOGLE_SPREADSHEET_ID GOOGLE_SERVICE_ACCOUNT_JSON; do
+            eval "value=\$$name"
+            if [ -z "$value" ]; then
+              missing="$missing $name"
+            else
+              echo "  есть: $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Не заданы секреты:$missing"
+            echo "Добавьте их: Settings -> Secrets and variables -> Actions -> New repository secret"
+            exit 1
+          fi
+          echo "Все пять секретов на месте"
+
       - name: Создать ключ сервисного аккаунта Google
         # Секрет передаём через переменную окружения, а не подставляем
         # прямо в команду: так он не попадёт в логи сборки.
         env:
           GOOGLE_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: printf '%s' "$GOOGLE_KEY" > service_account.json
+        run: |
+          printf '%s' "$GOOGLE_KEY" > service_account.json
+          # Убеждаемся, что это действительно ключ сервисного аккаунта,
+          # а не обрезанный кусок файла. Печатаем только client_email —
+          # он не секретный, зато сразу видно, тот ли ключ подставлен.
+          python -c "
+          import json, sys
+          try:
+              data = json.load(open('service_account.json', encoding='utf-8'))
+          except Exception as exc:
+              print('::error::Секрет GOOGLE_SERVICE_ACCOUNT_JSON — не разбирается как JSON:', exc)
+              print('Скопируйте содержимое service_account.json ЦЕЛИКОМ, от { до }')
+              sys.exit(1)
+          if data.get('type') != 'service_account':
+              print('::error::В секрете лежит не ключ сервисного аккаунта')
+              sys.exit(1)
+          print('ключ Google на месте, client_email =', data.get('client_email'))
+          "
 
       - name: Синхронизировать продажи
         env:

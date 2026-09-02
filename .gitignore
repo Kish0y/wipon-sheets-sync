@@ -1,0 +1,20 @@
+# Секреты — ни в коем случае не в репозиторий
+.env
+service_account.json
+*.json.key
+credentials*.json
+
+# Рабочие файлы скрипта (создаются автоматически)
+token.json
+state.json
+state.tmp
+items_cache.json
+raw_sale_sample.json
+sync.log
+sync.log.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc

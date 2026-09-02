@@ -1,0 +1,12 @@
+# HTTP-запросы к API Wipon
+requests>=2.32,<3
+
+# Чтение настроек из файла .env
+python-dotenv>=1.0,<2
+
+# Google Sheets API + авторизация сервисного аккаунта
+google-api-python-client>=2.100,<3
+google-auth>=2.30,<3
+
+# База часовых поясов для zoneinfo (нужна на Windows, где её нет в системе)
+tzdata>=2024.1

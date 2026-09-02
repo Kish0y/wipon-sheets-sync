@@ -1,0 +1,76 @@
+# Автоматическая синхронизация продаж Wipon в Google Таблицу.
+# GitHub бесплатно запускает этот файл по расписанию на своих серверах —
+# свой компьютер держать включённым не нужно.
+
+name: Синхронизация продаж Wipon
+
+on:
+  schedule:
+    # Каждые 10 минут. Время у GitHub всегда UTC, но нам это не важно:
+    # часовой пояс продаж скрипт берёт из переменной TIMEZONE.
+    # ВАЖНО: расписание у GitHub неточное — запуск может задержаться
+    # на 10-20 минут при высокой нагрузке. Продажи не потеряются,
+    # просто появятся в таблице чуть позже.
+    - cron: "*/10 * * * *"
+  # Позволяет запустить вручную кнопкой Run workflow на вкладке Actions.
+  workflow_dispatch:
+
+# Не даём запуститься второй копии, пока работает первая.
+concurrency:
+  group: wipon-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Забрать код из репозитория
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установить зависимости
+        run: pip install --quiet -r requirements.txt
+
+      - name: Создать ключ сервисного аккаунта Google
+        # Секрет передаём через переменную окружения, а не подставляем
+        # прямо в команду: так он не попадёт в логи сборки.
+        env:
+          GOOGLE_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: printf '%s' "$GOOGLE_KEY" > service_account.json
+
+      - name: Синхронизировать продажи
+        env:
+          # --- секреты, их задаём в настройках репозитория ---
+          WIPON_USERNAME: ${{ secrets.WIPON_USERNAME }}
+          WIPON_PASSWORD: ${{ secrets.WIPON_PASSWORD }}
+          WIPON_EMPLOYEE_ID: ${{ secrets.WIPON_EMPLOYEE_ID }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          # --- обычные настройки, их прятать незачем ---
+          GOOGLE_CREDENTIALS_FILE: service_account.json
+          GOOGLE_SHEET_NAME: Продажи
+          TIMEZONE: Asia/Almaty
+          # Машина GitHub одноразовая: файла state.json на ней нет,
+          # поэтому от дублей защищаемся сверкой с колонкой ID в таблице.
+          RECONCILE_WITH_SHEET: "1"
+          # Раз состояние не сохраняется, каждый запуск берём сутки —
+          # этого хватает с запасом, даже если расписание задержится.
+          SYNC_DAYS_BACK: "1"
+          LOG_LEVEL: INFO
+        run: python wipon_sync.py
+
+      - name: Сохранить лог, если что-то сломалось
+        # Запускается только при ошибке — лог можно скачать со страницы запуска
+        # и посмотреть, что именно пошло не так.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log
+          path: sync.log
+          retention-days: 7

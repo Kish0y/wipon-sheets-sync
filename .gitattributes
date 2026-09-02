@@ -1,0 +1,4 @@
+# Windows ставит в конце строк CRLF, Linux — LF.
+# Просим Git хранить всё с LF: иначе shell-скрипты, выполненные
+# на сервере Linux, падают с ошибкой вида "bad interpreter: \r".
+* text=auto eol=lf

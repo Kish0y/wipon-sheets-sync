@@ -1,0 +1,25 @@
+# systemd-юнит: описывает, ЧТО запускать.
+# Сам по себе он ничего не делает по расписанию — расписание задаёт
+# файл wipon-sync.timer рядом. Type=oneshot означает «запустился,
+# отработал, завершился» — ровно так и работает наш скрипт.
+
+[Unit]
+Description=Синхронизация продаж Wipon в Google Таблицу
+# Не стартовать, пока нет сети: иначе первый запуск после перезагрузки упадёт.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/wipon-sync
+# Запускаем интерпретатор из виртуального окружения, а не системный python3.
+ExecStart=/opt/wipon-sync/.venv/bin/python /opt/wipon-sync/wipon_sync.py
+# Если Wipon не отвечает, скрипт завершится с кодом 1. Это не повод
+# считать сервис сломанным — следующий запуск по таймеру попробует снова.
+SuccessExitStatus=0 1
+# Ограничиваем время на случай, если запрос к API зависнет.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -312,6 +312,33 @@ def build_branch_summary(sheet_rows: Sequence[Sequence[Any]]) -> dict:
     return summary
 
 
+def split_rows_by_branch(sheet_rows: Sequence[Sequence[Any]]) -> dict:
+    """Раскладываем строки общего листа по филиалам.
+
+    На вход идут строки листа «Продажи»:
+        [дата, филиал, товар, количество, цена, сумма, ID продажи]
+
+    На выходе — словарь «филиал → список строк», причём колонку с филиалом
+    из строк убираем: на его собственном листе она не нужна, там и так
+    всё про один филиал.
+
+    Строки внутри филиала идут по дате, старые сверху.
+    """
+    by_branch: dict = {}
+    for row in sheet_rows:
+        if len(row) < 6:
+            continue
+        branch = str(row[1]).strip() or "Без филиала"
+        without_branch = [row[0]] + list(row[2:])
+        by_branch.setdefault(branch, []).append(without_branch)
+
+    # Сортируем по дате. В таблице дата хранится числом (дни с 30.12.1899),
+    # поэтому обычное сравнение чисел даёт правильный хронологический порядок.
+    for rows in by_branch.values():
+        rows.sort(key=lambda r: (_to_float(r[0]), str(r[-1])))
+    return by_branch
+
+
 def sale_sort_key(sale: Mapping[str, Any]) -> tuple:
     """Ключ сортировки продаж: сначала по дате, потом по id.
 

@@ -36,6 +36,17 @@ HEADER = [
     "ID продажи",
 ]
 
+# Шапка листа отдельного филиала: колонка «Филиал» там не нужна,
+# весь лист и так про одну точку.
+BRANCH_HEADER = [
+    "Дата и время продажи",
+    "Название товара",
+    "Количество",
+    "Цена за единицу",
+    "Сумма",
+    "ID продажи",
+]
+
 # Разрешение только на работу с таблицами.
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -49,6 +60,20 @@ LAST_COLUMN = "G"
 
 class SheetsError(Exception):
     """Ошибка при работе с Google Sheets."""
+
+
+def _to_number(value: Any) -> float:
+    """Приводим значение из таблицы к числу.
+
+    Google при valueRenderOption=UNFORMATTED_VALUE отдаёт числа числами,
+    но в ячейке может оказаться и текст — тогда считаем её нулём.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _quote_sheet_name(name: str) -> str:
@@ -153,7 +178,9 @@ class SheetsWriter:
         self._sheet_id = sheet_id
         self._apply_column_formats(sheet_id)
 
-    def _apply_column_formats(self, sheet_id: int) -> None:
+    def _apply_column_formats(
+        self, sheet_id: int, date_column: int = 0, text_column: int = 6
+    ) -> None:
         """Задаём формат колонок, чтобы Google не искажал наши данные.
 
         Зачем это нужно: мы пишем с valueInputOption=USER_ENTERED, то есть
@@ -180,10 +207,13 @@ class SheetsWriter:
             }
 
         requests = [
-            # A — «Дата и время продажи»
-            column_format(0, 1, {"type": "DATE_TIME", "pattern": "dd.mm.yyyy hh:mm:ss"}),
-            # G — «ID продажи», строго текстом
-            column_format(6, 7, {"type": "TEXT"}),
+            # Колонка с датой продажи
+            column_format(
+                date_column, date_column + 1,
+                {"type": "DATE_TIME", "pattern": "dd.mm.yyyy hh:mm:ss"},
+            ),
+            # Колонка «ID продажи» — строго текстом
+            column_format(text_column, text_column + 1, {"type": "TEXT"}),
         ]
         try:
             self.sheets.batchUpdate(
@@ -279,6 +309,54 @@ class SheetsWriter:
             self._apply_column_formats(self._sheet_id)
 
         return int(updated)
+
+    # ------------------------------------------------------------------
+    # Отдельный лист под каждый филиал
+    # ------------------------------------------------------------------
+
+    def write_branch_sheets(self, by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> None:
+        """Раскладываем продажи по отдельным листам — по листу на филиал.
+
+        Каждый лист переписывается целиком: шапка, строки продаж, пустая
+        строка и итог внизу. Почему не дозапись, как в общем листе: итоговая
+        строка стоит последней, и append положил бы новые продажи ПОСЛЕ неё.
+        Данные для перезаписи берутся из общего листа «Продажи», так что
+        потерять их нельзя — он остаётся первоисточником.
+        """
+        for branch in sorted(by_branch, key=branch_sort_key):
+            rows = list(by_branch[branch])
+            sheet_id = self._ensure_sheet_exists(branch)
+
+            quantity = sum(_to_number(r[2]) for r in rows if len(r) > 2)
+            total = sum(_to_number(r[4]) for r in rows if len(r) > 4)
+            receipts = len({str(r[5]) for r in rows if len(r) > 5 and str(r[5]).strip()})
+
+            values: List[List[Any]] = [BRANCH_HEADER]
+            values.extend(list(r) for r in rows)
+            values.append([])                      # пустая строка перед итогом
+            values.append(["ИТОГО", f"чеков: {receipts}", quantity, "", total, ""])
+
+            try:
+                self.sheets.values().clear(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=self._range("A:F", branch),
+                    body={},
+                ).execute()
+                self.sheets.values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=self._range("A1", branch),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": values},
+                ).execute()
+                # На листе филиала ID продажи лежит в колонке F (индекс 5).
+                self._apply_column_formats(sheet_id, date_column=0, text_column=5)
+            except HttpError as exc:
+                raise SheetsError(f"Не удалось записать лист «{branch}»: {exc}") from exc
+
+            log.info(
+                "Лист «%s»: строк %d, итого %s шт на %s тг",
+                branch, len(rows), quantity, total,
+            )
 
     # ------------------------------------------------------------------
     # Сводка по филиалам

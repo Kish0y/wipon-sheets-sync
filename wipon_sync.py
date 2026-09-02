@@ -34,7 +34,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from config import Config, ConfigError
 from state import SyncState
-from transform import build_branch_summary, SaleRow, sale_sort_key, sales_to_rows
+from transform import (
+    build_branch_summary,
+    SaleRow,
+    sale_sort_key,
+    sales_to_rows,
+    split_rows_by_branch,
+)
 
 log = logging.getLogger("wipon_sync")
 
@@ -235,8 +241,8 @@ def print_rows(rows: Sequence[SaleRow]) -> None:
 # БЛОК 5. Основной сценарий
 # ----------------------------------------------------------------------
 
-def update_summary(cfg: Config, tz) -> None:
-    """Пересчитываем лист «Сводка» по тому, что уже лежит в таблице.
+def update_reports(cfg: Config, tz) -> None:
+    """Перестраиваем листы филиалов и сводку по тому, что лежит в таблице.
 
     Считаем именно по таблице, а не по свежей порции продаж: иначе после
     запуска, в котором не было новых чеков, сводка обнулилась бы.
@@ -247,14 +253,21 @@ def update_summary(cfg: Config, tz) -> None:
 
     try:
         writer = SheetsWriter(cfg)
-        summary = build_branch_summary(writer.read_data_rows())
+        # Один раз читаем общий лист — он первоисточник и для листов
+        # филиалов, и для сводки.
+        sheet_rows = writer.read_data_rows()
+
+        # Отдельный лист под каждый филиал, с итогом внизу.
+        writer.write_branch_sheets(split_rows_by_branch(sheet_rows))
+
+        # Общая сводка: все филиалы в одном месте.
         writer.write_summary(
             cfg.item_filter,
-            summary,
+            build_branch_summary(sheet_rows),
             datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S"),
         )
     except Exception as exc:                      # noqa: BLE001
-        log.warning("Не удалось обновить сводку по филиалам: %s", exc)
+        log.warning("Не удалось обновить отчёты по филиалам: %s", exc)
 
 
 def run(args) -> int:
@@ -287,7 +300,7 @@ def run(args) -> int:
         state.last_sync_at = started_at
         state.save()
         if not args.dry_run:
-            update_summary(cfg, tz)
+            update_reports(cfg, tz)
         return 0
 
     # --- Шаг 3: превращаем продажи в строки таблицы ---
@@ -315,7 +328,7 @@ def run(args) -> int:
             log.info("После сверки с таблицей новых строк не осталось")
             state.last_sync_at = started_at
             state.save()
-            update_summary(cfg, tz)
+            update_reports(cfg, tz)
             return 0
 
     written = writer.append_rows([r.as_sheet_row() for r in rows])
@@ -328,7 +341,7 @@ def run(args) -> int:
     state.save()
 
     # --- Шаг 6: пересчитываем сводку по филиалам ---
-    update_summary(cfg, tz)
+    update_reports(cfg, tz)
 
     log.info(
         "ИТОГ: обработано продаж %d, записано строк %d, последний ID продажи %s",

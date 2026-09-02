@@ -258,6 +258,9 @@ def update_summary_sheet(cfg: Config, tz, by_branch: dict) -> None:
     Ошибку наверх не пропускаем: сводка — витрина, из-за неё не должен
     падать запуск, продажи к этому моменту уже записаны.
     """
+    if not cfg.summary_sheet_name:
+        return                       # сводка отключена в настройках
+
     from sheets import SheetsWriter
 
     try:

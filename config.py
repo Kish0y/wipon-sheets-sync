@@ -83,8 +83,10 @@ class Config:
     sheet_name: str = field(default_factory=lambda: _env_str("GOOGLE_SHEET_NAME", "Продажи"))
 
     # Лист со сводкой по филиалам. Перезаписывается при каждом запуске.
+    # Пустое значение означает «сводку не вести»: итоги и так есть
+    # в строке ИТОГО каждого блока.
     summary_sheet_name: str = field(
-        default_factory=lambda: _env_str("GOOGLE_SUMMARY_SHEET_NAME", "Сводка")
+        default_factory=lambda: _env_str("GOOGLE_SUMMARY_SHEET_NAME")
     )
 
     # --- Фильтр товаров ---

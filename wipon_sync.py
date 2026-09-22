@@ -28,7 +28,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Any, List, Mapping, Sequence, Set
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -132,10 +132,17 @@ def get_timezone(cfg: Config) -> ZoneInfo:
 # БЛОК 2. Период выборки
 # ----------------------------------------------------------------------
 
-def calculate_period(cfg: Config, state: SyncState, tz: ZoneInfo, days_override: int | None):
+def calculate_period(
+    cfg: Config,
+    state: SyncState,
+    tz: ZoneInfo,
+    days_override: int | None,
+    since: date | None = None,
+):
     """Считаем, за какой период просить продажи.
 
     Логика:
+      * если задан --since ГГГГ-ММ-ДД, берём продажи с начала этого дня;
       * если задан --days N, берём последние N дней;
       * если это первый запуск (нет last_sync_at), берём SYNC_DAYS_BACK дней;
       * иначе — от времени прошлой синхронизации минус «перекрытие»
@@ -145,7 +152,12 @@ def calculate_period(cfg: Config, state: SyncState, tz: ZoneInfo, days_override:
     """
     date_to = datetime.now(tz)
 
-    if days_override is not None:
+    if since is not None:
+        # Полночь указанного дня по времени магазина: «с 1 июня» — это
+        # с 01.06 00:00 по Алматы, а не с какого-то часа 31 мая.
+        date_from = datetime.combine(since, time.min, tzinfo=tz)
+        log.info("Период задан вручную: с %s", date_from.strftime("%d.%m.%Y"))
+    elif days_override is not None:
         date_from = date_to - timedelta(days=days_override)
         log.info("Период задан вручную: последние %d дн.", days_override)
     elif state.last_sync_at is None:
@@ -200,7 +212,7 @@ def collect_sales(cfg: Config, account: WiponAccount, tz: ZoneInfo, args, state:
     account.validate()
     client = WiponClient(cfg, account)
 
-    date_from, date_to = calculate_period(cfg, state, tz, args.days)
+    date_from, date_to = calculate_period(cfg, state, tz, args.days, args.since)
     sales = client.fetch_sales(date_from, date_to)
 
     # Один раз при первом реальном запуске сохраняем сырой JSON продажи.
@@ -339,11 +351,24 @@ def run(args) -> int:
     setup_logging(cfg, verbose=args.verbose)
     tz = get_timezone(cfg)
 
+    # Флаг --account N: работаем только с одним аккаунтом (например, чтобы
+    # дозалить историю одной кассы, не трогая другую). Остальные аккаунты
+    # не опрашиваются, но их блоки на листе сохраняются как есть.
+    accounts = cfg.accounts
+    if args.account is not None:
+        accounts = [a for a in cfg.accounts if a.number == args.account]
+        if not accounts:
+            raise ConfigError(
+                f"Аккаунт {args.account} не найден в .env "
+                f"(нужна переменная WIPON_{args.account}_USERNAME)"
+            )
+
     log.info("=" * 70)
     log.info(
-        "Старт синхронизации%s, аккаунтов Wipon: %d",
+        "Старт синхронизации%s, аккаунтов Wipon: %d%s",
         " (тестовый режим)" if args.test else "",
-        len(cfg.accounts),
+        len(accounts),
+        f" (только аккаунт {args.account})" if args.account is not None else "",
     )
 
     # --- Шаг 1: забираем продажи каждого аккаунта ---
@@ -352,7 +377,7 @@ def run(args) -> int:
     # состояние, поэтому следующий запуск по расписанию его повторит.
     batches: List[AccountBatch] = []
     failures: List[Exception] = []
-    for account in cfg.accounts:
+    for account in accounts:
         try:
             batches.append(collect_account(cfg, account, tz, args))
         except Exception as exc:                  # noqa: BLE001
@@ -472,6 +497,18 @@ def parse_args(argv=None):
         "--days",
         type=int,
         help="разово забрать продажи за последние N дней (игнорирует сохранённое состояние)",
+    )
+    parser.add_argument(
+        "--since",
+        type=date.fromisoformat,
+        metavar="ГГГГ-ММ-ДД",
+        help="разово забрать продажи начиная с этой даты, например --since 2026-06-01",
+    )
+    parser.add_argument(
+        "--account",
+        type=int,
+        metavar="N",
+        help="работать только с аккаунтом N из .env (1, 2...); блоки остальных не трогаются",
     )
     parser.add_argument(
         "--reset-state",

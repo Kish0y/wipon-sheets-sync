@@ -52,11 +52,20 @@ def fake_item_titles() -> Dict[str, str]:
     return titles
 
 
-def fake_sales(tz: ZoneInfo, count: int = 4, seed: int | None = None) -> List[Dict[str, Any]]:
+def fake_sales(
+    tz: ZoneInfo,
+    count: int = 4,
+    seed: int | None = None,
+    id_prefix: str = "TEST",
+) -> List[Dict[str, Any]]:
     """Генерируем несколько правдоподобных чеков.
 
     Каждый чек — словарь с id, created_at и списком items,
     то есть ровно то, что скрипт ожидает получить от реального API.
+
+    id_prefix — начало ID чека. У второго аккаунта он свой (TEST2), иначе
+    тестовые чеки двух касс получили бы одинаковые ID и защита от дублей
+    выбросила бы половину из них.
     """
     rnd = random.Random(seed)
     now = datetime.now(tz)
@@ -91,7 +100,7 @@ def fake_sales(tz: ZoneInfo, count: int = 4, seed: int | None = None) -> List[Di
         branch = rnd.choice(FAKE_BRANCHES)
         sales.append(
             {
-                "id": f"TEST-{batch}-{n}",
+                "id": f"{id_prefix}-{batch}-{n}",
                 "created_at": sold_at.strftime("%Y-%m-%d %H:%M:%S"),
                 "stock": branch,
                 "item_sale": positions,

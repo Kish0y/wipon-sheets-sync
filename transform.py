@@ -45,6 +45,27 @@ TITLE_FIELDS = ("title", "quick_title", "item_title", "name")
 # Если его вдруг не окажется, пробуем кассу — она тоже привязана к точке.
 BRANCH_SOURCES = ("stock", "cashbox")
 
+# Разделитель между названием аккаунта и филиала в имени блока:
+#   «Магазин 2 / Основной склад»
+BRANCH_SEPARATOR = " / "
+
+# Кириллические буквы, которые на экране не отличить от латинских.
+# Кассиры постоянно переключают раскладку, и один и тот же товар в одной
+# кассе записан «Магний 3x Nurelum» (латинская x), а в другой —
+# «Магний 3х Nurelum» (кириллическая х). Для Python это разные строки,
+# и фильтр товаров молча отсеивал бы все продажи второй кассы.
+# Перед сравнением такие буквы заменяются латинскими двойниками.
+_LOOKALIKES = str.maketrans("авекмнорстухі", "abekmhopctyxi")
+
+
+def normalize_title(title: str) -> str:
+    """Приводим название товара к виду, удобному для сравнения:
+    без учёта регистра, лишних пробелов и раскладки похожих букв.
+
+        normalize_title("Магний  3х Nurelum") == normalize_title("магний 3x nurelum")
+    """
+    return " ".join(title.casefold().translate(_LOOKALIKES).split())
+
 
 @dataclass
 class SaleRow:
@@ -192,16 +213,29 @@ def resolve_branch(sale: Mapping[str, Any]) -> str:
     return "Без филиала"
 
 
+def branch_label(account_label: str, branch: str) -> str:
+    """Имя блока на листе: филиал с приставкой аккаунта.
+
+    У разных касс филиалы часто называются одинаково («Основной склад»),
+    поэтому ко второму аккаунту добавляется его название:
+        branch_label("", "2 точка")                 -> "2 точка"
+        branch_label("Магазин 2", "Основной склад") -> "Магазин 2 / Основной склад"
+    """
+    return f"{account_label}{BRANCH_SEPARATOR}{branch}" if account_label else branch
+
+
 def sale_to_rows(
     sale: Mapping[str, Any],
     item_titles: Mapping[str, str],
     tz: ZoneInfo,
     item_filter: Sequence[str] = (),
+    account_label: str = "",
 ) -> List[SaleRow]:
     """Разбираем одну продажу на строки таблицы (по строке на товар).
 
     item_filter — список названий товаров, которые нас интересуют.
     Пустой список означает «берём все товары».
+    account_label — приставка аккаунта к названию филиала (см. branch_label).
     """
     sale_id = sale.get("id")
     if sale_id is None:
@@ -209,12 +243,15 @@ def sale_to_rows(
         return []
 
     sold_at = format_datetime(_first_present(sale, DATE_FIELDS), tz)
-    branch = resolve_branch(sale)
+    branch = branch_label(account_label, resolve_branch(sale))
 
     positions = _first_present(sale, ITEMS_FIELDS)
     if not isinstance(positions, list) or not positions:
         log.warning("В продаже id=%s нет списка товаров — строка не создана", sale_id)
         return []
+
+    # Названия из фильтра нормализуем один раз, а не для каждой позиции.
+    wanted = {normalize_title(name) for name in item_filter}
 
     rows: List[SaleRow] = []
     for position in positions:
@@ -223,11 +260,10 @@ def sale_to_rows(
 
         title = _resolve_title(position, item_titles)
 
-        # Фильтр по названию товара. Сравниваем без учёта регистра и
-        # лишних пробелов, чтобы «магний 3x nurelum» тоже находился.
-        if item_filter and title.casefold().strip() not in {
-            wanted.casefold().strip() for wanted in item_filter
-        }:
+        # Фильтр по названию товара. Сравниваем без учёта регистра, лишних
+        # пробелов и раскладки похожих букв (см. normalize_title), чтобы
+        # «магний 3х nurelum» с кириллической «х» тоже находился.
+        if wanted and normalize_title(title) not in wanted:
             continue
 
         quantity = _to_float(_first_present(position, ("quantity",)))
@@ -259,11 +295,12 @@ def sales_to_rows(
     item_titles: Mapping[str, str],
     tz: ZoneInfo,
     item_filter: Sequence[str] = (),
+    account_label: str = "",
 ) -> List[SaleRow]:
     """Разбираем список продаж, сортируя итог по дате (старые продажи выше)."""
     rows: List[SaleRow] = []
     for sale in sales:
-        rows.extend(sale_to_rows(sale, item_titles, tz, item_filter))
+        rows.extend(sale_to_rows(sale, item_titles, tz, item_filter, account_label))
     return rows
 
 
@@ -284,6 +321,38 @@ def branch_sort_key(branch: str) -> tuple:
     if match:
         return (1, int(match.group()), branch.casefold())
     return (0, 0, branch.casefold())
+
+
+def make_block_sort_key(account_labels: Sequence[str]):
+    """Ключ сортировки блоков на листе, когда аккаунтов несколько.
+
+    Блоки идут группами: сначала все филиалы первого аккаунта, потом второго
+    и так далее, а внутри группы — в обычном порядке branch_sort_key.
+    Аккаунт блока узнаём по приставке «Название / ». Блок без приставки
+    принадлежит аккаунту с пустым названием (обычно первому). Блоки, которые
+    ни к одному аккаунту не подходят (аккаунт убрали из .env), уходят в конец —
+    их данные при этом сохраняются.
+
+    Отдельную функцию просто по имени не сделать: номер в «Магазин 2 / ...»
+    сбил бы сортировку branch_sort_key, которая ищет в названии первое число.
+    """
+    labels = list(account_labels)
+
+    def key(block_name: str) -> tuple:
+        for index, label in enumerate(labels):
+            if label and block_name.startswith(label + BRANCH_SEPARATOR):
+                return (index,) + branch_sort_key(block_name[len(label) + len(BRANCH_SEPARATOR):])
+        # Приставка есть, но такого аккаунта в настройках нет (его убрали или,
+        # например, на GitHub ещё не добавлены его секреты). Такой блок нельзя
+        # считать блоком аккаунта без приставки: по алфавиту «Алматы / ...»
+        # встал бы левее «Основного склада» и вся раскладка листа поехала бы.
+        if BRANCH_SEPARATOR in block_name:
+            return (len(labels),) + branch_sort_key(block_name)
+        if "" in labels:
+            return (labels.index(""),) + branch_sort_key(block_name)
+        return (len(labels),) + branch_sort_key(block_name)
+
+    return key
 
 
 def build_branch_summary(by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> dict:

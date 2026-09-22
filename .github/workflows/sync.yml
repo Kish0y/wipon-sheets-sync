@@ -48,9 +48,18 @@ jobs:
           WIPON_EMPLOYEE_ID: ${{ secrets.WIPON_EMPLOYEE_ID }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # Второй аккаунт необязателен: включается, если задан WIPON_2_USERNAME.
+          WIPON_2_USERNAME: ${{ secrets.WIPON_2_USERNAME }}
+          WIPON_2_PASSWORD: ${{ secrets.WIPON_2_PASSWORD }}
+          WIPON_2_EMPLOYEE_ID: ${{ secrets.WIPON_2_EMPLOYEE_ID }}
         run: |
           missing=""
-          for name in WIPON_USERNAME WIPON_PASSWORD WIPON_EMPLOYEE_ID                       GOOGLE_SPREADSHEET_ID GOOGLE_SERVICE_ACCOUNT_JSON; do
+          required="WIPON_USERNAME WIPON_PASSWORD WIPON_EMPLOYEE_ID GOOGLE_SPREADSHEET_ID GOOGLE_SERVICE_ACCOUNT_JSON"
+          # Если второй аккаунт включён, его пароль и employee_id тоже обязательны.
+          if [ -n "$WIPON_2_USERNAME" ]; then
+            required="$required WIPON_2_USERNAME WIPON_2_PASSWORD WIPON_2_EMPLOYEE_ID"
+          fi
+          for name in $required; do
             eval "value=\$$name"
             if [ -z "$value" ]; then
               missing="$missing $name"
@@ -63,7 +72,11 @@ jobs:
             echo "Добавьте их: Settings -> Secrets and variables -> Actions -> New repository secret"
             exit 1
           fi
-          echo "Все пять секретов на месте"
+          if [ -n "$WIPON_2_USERNAME" ]; then
+            echo "Все секреты на месте, аккаунтов Wipon: 2"
+          else
+            echo "Все секреты на месте, аккаунтов Wipon: 1 (второй не задан)"
+          fi
 
       - name: Создать ключ сервисного аккаунта Google
         # Секрет передаём через переменную окружения, а не подставляем
@@ -96,7 +109,16 @@ jobs:
           WIPON_PASSWORD: ${{ secrets.WIPON_PASSWORD }}
           WIPON_EMPLOYEE_ID: ${{ secrets.WIPON_EMPLOYEE_ID }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          # Второй аккаунт Wipon. Пока секрета WIPON_2_USERNAME нет,
+          # сюда подставляется пустая строка и второй аккаунт выключен.
+          WIPON_2_USERNAME: ${{ secrets.WIPON_2_USERNAME }}
+          WIPON_2_PASSWORD: ${{ secrets.WIPON_2_PASSWORD }}
+          WIPON_2_EMPLOYEE_ID: ${{ secrets.WIPON_2_EMPLOYEE_ID }}
           # --- обычные настройки, их прятать незачем ---
+          # Приставка к филиалам второго аккаунта на листе: «Алматы / Основной склад».
+          # Должна совпадать с WIPON_2_NAME в локальном .env: иначе продажи
+          # второго аккаунта разойдутся по двум блокам с разными приставками.
+          WIPON_2_NAME: Алматы
           GOOGLE_CREDENTIALS_FILE: service_account.json
           GOOGLE_SHEET_NAME: Продажи
           # Пусто — отдельный лист сводки не ведём

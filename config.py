@@ -50,16 +50,129 @@ class ConfigError(Exception):
     """Ошибка конфигурации: не хватает обязательной переменной в .env."""
 
 
+# Сколько аккаунтов Wipon максимум ищем в .env (WIPON_2_..., WIPON_3_... и т. д.).
+MAX_ACCOUNTS = 9
+
+
+@dataclass
+class WiponAccount:
+    """Один аккаунт Wipon (одна касса / одна компания).
+
+    Первый аккаунт задаётся переменными без номера:
+        WIPON_USERNAME, WIPON_PASSWORD, WIPON_EMPLOYEE_ID
+    Второй и следующие — с номером после WIPON_:
+        WIPON_2_USERNAME, WIPON_2_PASSWORD, WIPON_2_EMPLOYEE_ID, WIPON_2_NAME
+
+    У каждого аккаунта свои служебные файлы (токен, состояние, кеш товаров):
+    токены и ID продаж у разных касс разные, смешивать их нельзя.
+    """
+
+    number: int          # 1, 2, 3...
+    # Приставка к названиям филиалов в таблице. Нужна, потому что у разных
+    # касс филиалы часто называются одинаково («Основной склад»), и без
+    # приставки их продажи слились бы в один блок. У первого аккаунта
+    # приставка по умолчанию пустая: так уже записанные блоки остаются на месте.
+    label: str
+    username: str
+    password: str
+    employee_id: str
+    # Необязательный фильтр по складу. Если пусто — берём продажи по всем складам.
+    stock_id: str
+
+    @property
+    def prefix(self) -> str:
+        """Префикс имён переменных в .env: WIPON_ для первого, WIPON_2_ для второго."""
+        return "WIPON_" if self.number == 1 else f"WIPON_{self.number}_"
+
+    @property
+    def title(self) -> str:
+        """Как называть аккаунт в логах."""
+        return f"Аккаунт {self.number}" + (f" «{self.label}»" if self.label else "")
+
+    def _file(self, stem: str, suffix: str) -> Path:
+        """Имя служебного файла. У первого аккаунта оно прежнее (token.json),
+        у остальных с номером (token_2.json), чтобы не сломать уже работающую
+        установку."""
+        name = f"{stem}{suffix}" if self.number == 1 else f"{stem}_{self.number}{suffix}"
+        return BASE_DIR / name
+
+    @property
+    def token_file(self) -> Path:
+        return self._file("token", ".json")
+
+    @property
+    def state_file(self) -> Path:
+        return self._file("state", ".json")
+
+    @property
+    def items_cache_file(self) -> Path:
+        return self._file("items_cache", ".json")
+
+    @property
+    def raw_sample_file(self) -> Path:
+        return self._file("raw_sale_sample", ".json")
+
+    def validate(self) -> None:
+        """Проверяем, что у аккаунта заданы логин, пароль и ID сотрудника."""
+        missing = [
+            self.prefix + name
+            for name, value in (
+                ("USERNAME", self.username),
+                ("PASSWORD", self.password),
+                ("EMPLOYEE_ID", self.employee_id),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigError(
+                f"{self.title}: в .env не заданы переменные: " + ", ".join(missing)
+            )
+
+
+def _read_account(number: int) -> WiponAccount:
+    """Собираем аккаунт с номером number из переменных окружения."""
+    prefix = "WIPON_" if number == 1 else f"WIPON_{number}_"
+    default_label = "" if number == 1 else f"Аккаунт {number}"
+    return WiponAccount(
+        number=number,
+        label=_env_str(prefix + "NAME", default_label),
+        username=_env_str(prefix + "USERNAME"),
+        password=_env_str(prefix + "PASSWORD"),
+        employee_id=_env_str(prefix + "EMPLOYEE_ID"),
+        stock_id=_env_str(prefix + "STOCK_ID"),
+    )
+
+
+def load_accounts() -> list:
+    """Все аккаунты, которые заданы в .env, по порядку номеров.
+
+    Первый аккаунт есть всегда (если логин не заполнен, это выяснится при
+    проверке). Второй и следующие считаются заданными, если у них заполнен
+    логин: WIPON_2_USERNAME, WIPON_3_USERNAME...
+    """
+    accounts = [_read_account(1)]
+    for number in range(2, MAX_ACCOUNTS + 1):
+        if _env_str(f"WIPON_{number}_USERNAME"):
+            accounts.append(_read_account(number))
+
+    # Две кассы с одной приставкой снова смешали бы филиалы — не допускаем.
+    labels = [a.label for a in accounts]
+    duplicates = {label for label in labels if labels.count(label) > 1}
+    if duplicates:
+        raise ConfigError(
+            "У аккаунтов совпадают названия (переменные WIPON_NAME / WIPON_N_NAME): "
+            + ", ".join(repr(d) for d in sorted(duplicates))
+        )
+    return accounts
+
+
 @dataclass
 class Config:
     # --- Доступ к Wipon (Prosklad) ---
     api_url: str = field(default_factory=lambda: _env_str("WIPON_API_URL", "https://api.wipon.kz").rstrip("/"))
-    username: str = field(default_factory=lambda: _env_str("WIPON_USERNAME"))
-    password: str = field(default_factory=lambda: _env_str("WIPON_PASSWORD"))
-    employee_id: str = field(default_factory=lambda: _env_str("WIPON_EMPLOYEE_ID"))
 
-    # Необязательный фильтр по складу. Если пусто — берём продажи по всем складам.
-    stock_id: str = field(default_factory=lambda: _env_str("WIPON_STOCK_ID"))
+    # Аккаунты Wipon: логины, пароли и ID сотрудников. Подробнее — WiponAccount.
+    accounts: list = field(default_factory=load_accounts)
 
     # Формат дат для фильтров date_from / date_to.
     # В документации тип параметра указан как "date", пример значения не приведён,
@@ -126,13 +239,10 @@ class Config:
     # какое время продажи попадёт в таблицу.
     timezone: str = field(default_factory=lambda: _env_str("TIMEZONE", "Asia/Almaty"))
 
-    # --- Логи и служебные файлы ---
+    # --- Логи ---
+    # Служебные файлы аккаунтов (токен, состояние, кеш) описаны в WiponAccount.
     log_level: str = field(default_factory=lambda: _env_str("LOG_LEVEL", "INFO").upper())
     log_file: Path = field(default_factory=lambda: BASE_DIR / _env_str("LOG_FILE", "sync.log"))
-    token_file: Path = field(default_factory=lambda: BASE_DIR / "token.json")
-    state_file: Path = field(default_factory=lambda: BASE_DIR / "state.json")
-    items_cache_file: Path = field(default_factory=lambda: BASE_DIR / "items_cache.json")
-    raw_sample_file: Path = field(default_factory=lambda: BASE_DIR / "raw_sale_sample.json")
 
     def credentials_path(self) -> Path:
         """Путь к JSON-ключу сервисного аккаунта Google.
@@ -142,21 +252,9 @@ class Config:
         p = Path(self.google_credentials_file).expanduser()
         return p if p.is_absolute() else (BASE_DIR / p)
 
-    def validate_wipon(self) -> None:
-        """Проверяем, что заданы доступы к Wipon (не нужно в тестовом режиме)."""
-        missing = [
-            name
-            for name, value in (
-                ("WIPON_USERNAME", self.username),
-                ("WIPON_PASSWORD", self.password),
-                ("WIPON_EMPLOYEE_ID", self.employee_id),
-            )
-            if not value
-        ]
-        if missing:
-            raise ConfigError(
-                "В .env не заданы обязательные переменные: " + ", ".join(missing)
-            )
+    def account_labels(self) -> list:
+        """Приставки аккаунтов по порядку — задают порядок блоков на листе."""
+        return [a.label for a in self.accounts]
 
     def validate_google(self) -> None:
         """Проверяем, что заданы доступы к Google Таблице."""

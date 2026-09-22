@@ -2,7 +2,7 @@
 """
 wipon_sync.py — главный файл. Переносит продажи из кассы Wipon в Google Таблицу.
 
-Как это работает за один запуск:
+Как это работает за один запуск (для каждого аккаунта Wipon из .env):
   1. Читаем настройки из .env и вспоминаем, что уже синхронизировали (state.json).
   2. Берём access_token: из файла token.json, а если его нет или он протух —
      запрашиваем новый через POST /v1/oauth/token.
@@ -27,15 +27,17 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from typing import Any, List, Mapping, Sequence
+from typing import Any, List, Mapping, Sequence, Set
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from config import Config, ConfigError
+from config import Config, ConfigError, WiponAccount
 from state import SyncState
 from transform import (
     build_branch_summary,
+    make_block_sort_key,
     sale_row_sort_key,
     SaleRow,
     sale_sort_key,
@@ -164,19 +166,39 @@ def calculate_period(cfg: Config, state: SyncState, tz: ZoneInfo, days_override:
 # БЛОК 3. Получение данных: из реального API или фейковых
 # ----------------------------------------------------------------------
 
-def collect_sales(cfg: Config, tz: ZoneInfo, args, state: SyncState):
-    """Возвращаем пару (список продаж, справочник названий товаров)."""
+@dataclass
+class AccountBatch:
+    """Всё, что собрано по одному аккаунту Wipon за этот запуск."""
+
+    account: WiponAccount
+    state: SyncState          # память этого аккаунта (state.json / state_2.json)
+    started_at: datetime      # станет last_sync_at после успешной записи
+    sales: list               # продажи, которых ещё нет в state
+    item_titles: dict         # справочник названий товаров этого аккаунта
+    written: int = 0          # сколько строк записано за запуск
+
+    def rows(self, cfg: Config, tz: ZoneInfo) -> List[SaleRow]:
+        """Строки таблицы; филиалы получают приставку аккаунта."""
+        return sales_to_rows(
+            self.sales, self.item_titles, tz, cfg.item_filter, self.account.label
+        )
+
+
+def collect_sales(cfg: Config, account: WiponAccount, tz: ZoneInfo, args, state: SyncState):
+    """Возвращаем пару (список продаж, справочник названий товаров) одного аккаунта."""
     if args.test:
         from fake_data import fake_item_titles, fake_sales
 
         log.warning("РЕЖИМ ТЕСТА: реальный API не вызывается, данные сгенерированы локально")
-        return fake_sales(tz, count=args.fake_count), fake_item_titles()
+        # У каждого аккаунта свой префикс тестовых ID: TEST, TEST2, TEST3...
+        id_prefix = "TEST" if account.number == 1 else f"TEST{account.number}"
+        return fake_sales(tz, count=args.fake_count, id_prefix=id_prefix), fake_item_titles()
 
     # Боевой режим: работаем с настоящим API.
     from wipon_api import WiponClient
 
-    cfg.validate_wipon()
-    client = WiponClient(cfg)
+    account.validate()
+    client = WiponClient(cfg, account)
 
     date_from, date_to = calculate_period(cfg, state, tz, args.days)
     sales = client.fetch_sales(date_from, date_to)
@@ -184,13 +206,13 @@ def collect_sales(cfg: Config, tz: ZoneInfo, args, state: SyncState):
     # Один раз при первом реальном запуске сохраняем сырой JSON продажи.
     # В документации примера ответа для списка продаж нет, поэтому файл
     # raw_sale_sample.json — способ сверить имена полей с тем, что мы разбираем.
-    if sales and not cfg.raw_sample_file.is_file():
-        cfg.raw_sample_file.write_text(
+    if sales and not account.raw_sample_file.is_file():
+        account.raw_sample_file.write_text(
             json.dumps(sales[0], ensure_ascii=False, indent=2), encoding="utf-8"
         )
         log.info(
             "Сохранил пример ответа API в %s — сверьте имена полей, если строки выглядят пустыми",
-            cfg.raw_sample_file.name,
+            account.raw_sample_file.name,
         )
 
     # Справочник товаров нужен, только если в самих продажах нет названий.
@@ -198,19 +220,41 @@ def collect_sales(cfg: Config, tz: ZoneInfo, args, state: SyncState):
     return sales, item_titles
 
 
+def collect_account(cfg: Config, account: WiponAccount, tz: ZoneInfo, args) -> AccountBatch:
+    """Забираем продажи одного аккаунта и отсекаем уже записанные."""
+    log.info("--- %s ---", account.title)
+    state = SyncState(account.state_file, cfg.max_remembered_ids)
+    if args.reset_state:
+        state.reset()
+
+    started_at = datetime.now(tz)
+    sales, item_titles = collect_sales(cfg, account, tz, args, state)
+    fresh = sorted(filter_new_sales(sales, state), key=sale_sort_key)
+    log.info("%s: получено продаж %d, из них новых %d", account.title, len(sales), len(fresh))
+    return AccountBatch(account, state, started_at, fresh, item_titles)
+
+
 # ----------------------------------------------------------------------
 # БЛОК 4. Фильтрация дублей
 # ----------------------------------------------------------------------
 
-def filter_new_sales(sales: Sequence[Mapping[str, Any]], state: SyncState) -> List[Mapping[str, Any]]:
-    """Оставляем только те продажи, которых ещё нет в таблице."""
+def filter_new_sales(
+    sales: Sequence[Mapping[str, Any]],
+    state: SyncState,
+    known_ids: Set[str] = frozenset(),
+) -> List[Mapping[str, Any]]:
+    """Оставляем только те продажи, которых ещё нет в таблице.
+
+    state     — память аккаунта: какие продажи он уже записывал;
+    known_ids — ID продаж, которые уже стоят на листе (сверка с таблицей).
+    """
     fresh = []
     skipped = 0
     for sale in sales:
         sale_id = sale.get("id")
         if sale_id is None:
             continue
-        if state.is_processed(str(sale_id)):
+        if state.is_processed(str(sale_id)) or str(sale_id) in known_ids:
             skipped += 1
             continue
         fresh.append(sale)
@@ -220,18 +264,18 @@ def filter_new_sales(sales: Sequence[Mapping[str, Any]], state: SyncState) -> Li
     return fresh
 
 
-def print_rows(rows: Sequence[SaleRow]) -> None:
+def print_rows(account: WiponAccount, rows: Sequence[SaleRow]) -> None:
     """Показываем строки в консоли (режим --dry-run)."""
-    print("\n--- Строки, которые были бы записаны в таблицу ---")
+    print(f"\n--- {account.title}: строки, которые были бы записаны в таблицу ---")
     print(
-        f"{'Дата и время':<21}{'Филиал':<17}{'Товар':<32}"
+        f"{'Дата и время':<21}{'Филиал':<30}{'Товар':<32}"
         f"{'Кол-во':>8}{'Цена':>10}{'Сумма':>11}  ID"
     )
     for row in rows:
         title = row.title if len(row.title) <= 30 else row.title[:29] + "…"
-        branch = row.branch if len(row.branch) <= 15 else row.branch[:14] + "…"
+        branch = row.branch if len(row.branch) <= 28 else row.branch[:27] + "…"
         print(
-            f"{row.sold_at:<21}{branch:<17}{title:<32}{row.quantity:>8.3f}"
+            f"{row.sold_at:<21}{branch:<30}{title:<32}{row.quantity:>8.3f}"
             f"{row.unit_price:>10.2f}{row.total:>11.2f}  {row.sale_id}"
         )
     print(f"--- Итого строк: {len(rows)} ---\n")
@@ -252,7 +296,7 @@ def sale_ids_from_blocks(by_branch: dict) -> set:
     return ids
 
 
-def update_summary_sheet(cfg: Config, tz, by_branch: dict) -> None:
+def update_summary_sheet(cfg: Config, tz, by_branch: dict, sort_key) -> None:
     """Обновляем лист «Сводка» по блокам, которые лежат в таблице.
 
     Ошибку наверх не пропускаем: сводка — витрина, из-за неё не должен
@@ -268,9 +312,25 @@ def update_summary_sheet(cfg: Config, tz, by_branch: dict) -> None:
             cfg.item_filter,
             build_branch_summary(by_branch),
             datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S"),
+            sort_key,
         )
     except Exception as exc:                      # noqa: BLE001
         log.warning("Не удалось обновить сводку: %s", exc)
+
+
+def save_states(batches: Sequence[AccountBatch]) -> None:
+    """Запоминаем время синхронизации каждого успешно отработавшего аккаунта."""
+    for batch in batches:
+        batch.state.last_sync_at = batch.started_at
+        batch.state.save()
+
+
+def exit_code(failures: Sequence[Exception]) -> int:
+    """Код возврата процесса: 0 — всё хорошо, 2 — у какого-то аккаунта
+    не заполнены настройки, 1 — другая ошибка (сеть, API)."""
+    if not failures:
+        return 0
+    return 2 if any(isinstance(exc, ConfigError) for exc in failures) else 1
 
 
 def run(args) -> int:
@@ -280,98 +340,111 @@ def run(args) -> int:
     tz = get_timezone(cfg)
 
     log.info("=" * 70)
-    log.info("Старт синхронизации%s", " (тестовый режим)" if args.test else "")
+    log.info(
+        "Старт синхронизации%s, аккаунтов Wipon: %d",
+        " (тестовый режим)" if args.test else "",
+        len(cfg.accounts),
+    )
 
-    state = SyncState(cfg.state_file, cfg.max_remembered_ids)
-    if args.reset_state:
-        state.reset()
+    # --- Шаг 1: забираем продажи каждого аккаунта ---
+    # Аккаунты независимы: если касса одного недоступна, продажи другого
+    # всё равно попадут в таблицу. Упавший аккаунт не обновляет своё
+    # состояние, поэтому следующий запуск по расписанию его повторит.
+    batches: List[AccountBatch] = []
+    failures: List[Exception] = []
+    for account in cfg.accounts:
+        try:
+            batches.append(collect_account(cfg, account, tz, args))
+        except Exception as exc:                  # noqa: BLE001
+            failures.append(exc)
+            # У ошибки настройки трейсбек бесполезен — хватает текста.
+            log.error(
+                "%s: продажи не получены: %s",
+                account.title,
+                exc,
+                exc_info=not isinstance(exc, ConfigError),
+            )
 
-    started_at = datetime.now(tz)
+    # --- Шаг 2: режим просмотра — только показываем строки ---
+    if args.dry_run:
+        for batch in batches:
+            print_rows(batch.account, batch.rows(cfg, tz))
+        log.info("Режим --dry-run: в таблицу ничего не записано, состояние не изменено")
+        return exit_code(failures)
 
-    # --- Шаг 1: забираем продажи ---
-    sales, item_titles = collect_sales(cfg, tz, args, state)
-    if not sales:
-        log.info("Новых продаж нет. Обработано строк: 0")
-        state.last_sync_at = started_at
-        state.save()
-        return 0
+    block_order = make_block_sort_key(cfg.account_labels())
 
-    # --- Шаг 2: отсекаем то, что уже записывали ---
-    sales = sorted(filter_new_sales(sales, state), key=sale_sort_key)
-    if not sales:
-        log.info("Все полученные продажи уже были записаны раньше. Новых строк: 0")
-        state.last_sync_at = started_at
-        state.save()
-        if not args.dry_run:
+    if not any(batch.sales for batch in batches):
+        log.info("Новых продаж нет. Записано строк: 0")
+        save_states(batches)
+        if cfg.summary_sheet_name:
             from sheets import SheetsWriter
 
             writer = SheetsWriter(cfg)
             writer.ensure_sheet()
-            update_summary_sheet(cfg, tz, writer.read_branch_blocks())
-        return 0
+            update_summary_sheet(cfg, tz, writer.read_branch_blocks(), block_order)
+        return exit_code(failures)
 
-    # --- Шаг 3: превращаем продажи в строки таблицы ---
-    rows = sales_to_rows(sales, item_titles, tz, cfg.item_filter)
-    log.info("Готово к записи: %d продаж -> %d строк", len(sales), len(rows))
-
-    if args.dry_run:
-        print_rows(rows)
-        log.info("Режим --dry-run: в таблицу ничего не записано, состояние не изменено")
-        return 0
-
-    # --- Шаг 4: пишем в Google Таблицу ---
+    # --- Шаг 3: читаем лист ---
     from sheets import SheetsWriter
 
     writer = SheetsWriter(cfg)
     writer.ensure_sheet()
 
-    # Читаем то, что уже записано. Таблица — первоисточник: скрипт не хранит
-    # продажи у себя, а блоки перезаписываются целиком, поэтому старые строки
-    # нужно вычитать и дополнить новыми.
+    # Таблица — первоисточник: скрипт не хранит продажи у себя, а блоки
+    # перезаписываются целиком, поэтому уже записанное нужно вычитать
+    # и дополнить новыми строками. Блоки всех аккаунтов лежат на одном листе,
+    # так что читаем их один раз и пишем тоже один раз.
     by_branch = writer.read_branch_blocks()
 
     # Вторая проверка на дубли — уже по самой таблице. Помогает, если
     # state.json потеряли или скрипт запустили на другом компьютере.
+    sheet_ids: Set[str] = set()
     if cfg.reconcile_with_sheet:
-        known_ids = sale_ids_from_blocks(by_branch)
-        log.info("В таблице уже записано продаж: %d", len(known_ids))
-        state.add_known_ids(known_ids)
-        sales = sorted(filter_new_sales(sales, state), key=sale_sort_key)
-        rows = sales_to_rows(sales, item_titles, tz, cfg.item_filter)
-        if not rows:
-            log.info("После сверки с таблицей новых строк не осталось")
-            state.last_sync_at = started_at
-            state.save()
-            update_summary_sheet(cfg, tz, by_branch)
-            return 0
+        sheet_ids = sale_ids_from_blocks(by_branch)
+        log.info("В таблице уже записано продаж: %d", len(sheet_ids))
 
-    # Раскладываем новые строки по блокам их филиалов и сортируем каждый блок,
-    # чтобы продажи шли по порядку, а не хвостом в конце.
-    for row in rows:
-        by_branch.setdefault(row.branch, []).append(row.as_block_row())
-    for branch_rows in by_branch.values():
-        branch_rows.sort(key=sale_row_sort_key)
+    # --- Шаг 4: раскладываем новые строки по блокам филиалов ---
+    written = 0
+    for batch in batches:
+        new_sales = filter_new_sales(batch.sales, batch.state, sheet_ids)
+        batch_rows = sales_to_rows(
+            new_sales, batch.item_titles, tz, cfg.item_filter, batch.account.label
+        )
+        for row in batch_rows:
+            by_branch.setdefault(row.branch, []).append(row.as_block_row())
+        batch.written = len(batch_rows)
+        written += batch.written
 
-    writer.write_branch_blocks(by_branch)
-    written = len(rows)
+    if written:
+        # Сортируем каждый блок, чтобы продажи шли по порядку, а не хвостом.
+        for branch_rows in by_branch.values():
+            branch_rows.sort(key=sale_row_sort_key)
+        writer.write_branch_blocks(by_branch, block_order)
+    else:
+        log.info("После сверки с таблицей новых строк не осталось")
 
     # --- Шаг 5: запоминаем результат ---
     # Состояние обновляем ТОЛЬКО после успешной записи: если бы запись
     # упала, следующий запуск должен повторить эти же продажи.
-    state.mark_processed(str(s["id"]) for s in sales)
-    state.last_sync_at = started_at
-    state.save()
+    # Помечаем все продажи, прошедшие шаг 1: они либо записаны сейчас,
+    # либо уже стояли в таблице.
+    for batch in batches:
+        batch.state.mark_processed(str(s["id"]) for s in batch.sales)
+    save_states(batches)
 
     # --- Шаг 6: пересчитываем сводку по филиалам ---
-    update_summary_sheet(cfg, tz, by_branch)
+    update_summary_sheet(cfg, tz, by_branch, block_order)
 
-    log.info(
-        "ИТОГ: обработано продаж %d, записано строк %d, последний ID продажи %s",
-        len(sales),
-        written,
-        state.last_sale_id,
-    )
-    return 0
+    for batch in batches:
+        log.info(
+            "ИТОГ %s: новых продаж %d, записано строк %d",
+            batch.account.title,
+            len(batch.sales),
+            batch.written,
+        )
+    log.info("ИТОГ: записано строк всего %d", written)
+    return exit_code(failures)
 
 
 def parse_args(argv=None):

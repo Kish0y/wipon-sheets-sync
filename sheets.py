@@ -14,7 +14,7 @@ sheets.py — запись строк в Google Таблицу через servic
 """
 
 import logging
-from typing import Any, List, Mapping, Sequence
+from typing import Any, Callable, List, Mapping, Sequence
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -159,27 +159,33 @@ class SheetsWriter:
         Возвращаем {"2 точка": [[дата, товар, кол-во, цена, сумма, ID], ...]}.
         Строку с названием филиала, шапку и ИТОГО в данные не берём.
         """
-        last = column_letter(2 * BLOCK_STEP + BLOCK_WIDTH + 1)
         try:
             values = (
                 self.sheets.values()
                 .get(
                     spreadsheetId=self.spreadsheet_id,
-                    range=self._range(f"A:{last}"),
+                    # Только имя листа, без колонок — Google вернёт все
+                    # заполненные ячейки. Раньше здесь стояло A:X, то есть
+                    # ровно три блока: четвёртый и следующие (например,
+                    # филиалы второго аккаунта) не читались и при перезаписи
+                    # листа терялись.
+                    range=_quote_sheet_name(self.sheet_name),
                     valueRenderOption="UNFORMATTED_VALUE",
                 )
                 .execute()
                 .get("values", [])
             )
         except HttpError as exc:
-            log.warning("Не удалось прочитать таблицу (%s) — считаю её пустой", exc)
-            return {}
+            # Считать таблицу пустой здесь нельзя: следом лист перезаписывается
+            # целиком, и из-за разового сбоя Google пропала бы вся история продаж.
+            # Прерываем запуск — следующий по расписанию попробует снова.
+            raise SheetsError(f"Не удалось прочитать лист «{self.sheet_name}»: {exc}") from exc
 
         if not values:
             return {}
 
         by_branch: dict = {}
-        # Блоков может быть больше трёх, если в кассе появится новый филиал.
+        # Блоков может быть сколько угодно: новые филиалы, второй аккаунт.
         block_count = (max(len(row) for row in values) + BLOCK_STEP - 1) // BLOCK_STEP
         for index in range(max(block_count, 1)):
             start_col = index * BLOCK_STEP
@@ -219,14 +225,22 @@ class SheetsWriter:
         log.info("В таблице уже записано продаж: %d", len(ids))
         return ids
 
-    def write_branch_blocks(self, by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> None:
+    def write_branch_blocks(
+        self,
+        by_branch: Mapping[str, Sequence[Sequence[Any]]],
+        sort_key: Callable[[str], Any] = branch_sort_key,
+    ) -> None:
         """Записываем все блоки заново — целиком, а не дозаписью.
 
         Почему не append: строка ИТОГО стоит сразу под последней продажей
         своего блока, а у филиалов разное число продаж. Дозапись положила бы
         новые строки под ИТОГО и раскладка поехала бы.
+
+        sort_key задаёт порядок блоков слева направо. Когда аккаунтов
+        несколько, сюда передают make_block_sort_key: блоки первого
+        аккаунта идут первыми, второго — правее.
         """
-        branches = [b for b in sorted(by_branch, key=branch_sort_key)]
+        branches = sorted(by_branch, key=sort_key)
         if not branches:
             return
 
@@ -317,6 +331,7 @@ class SheetsWriter:
         item_names: Sequence[str],
         by_branch: Mapping[str, Mapping[str, Any]],
         generated_at: str,
+        sort_key: Callable[[str], Any] = branch_sort_key,
     ) -> None:
         """Перезаписываем лист со сводкой: по блоку на каждый филиал.
 
@@ -339,9 +354,9 @@ class SheetsWriter:
         total_sum = 0.0
         total_receipts = 0
 
-        # Порядок филиалов постоянный (см. branch_sort_key), чтобы строки
-        # не прыгали от запуска к запуску и цифры было удобно сравнивать.
-        for branch, data in sorted(by_branch.items(), key=lambda kv: branch_sort_key(kv[0])):
+        # Порядок филиалов постоянный (тот же, что у блоков на листе), чтобы
+        # строки не прыгали от запуска к запуску и цифры было удобно сравнивать.
+        for branch, data in sorted(by_branch.items(), key=lambda kv: sort_key(kv[0])):
             rows.append([branch])
             rows.append(["Количество, шт", data["quantity"]])
             rows.append(["Сумма, тг", data["total"]])

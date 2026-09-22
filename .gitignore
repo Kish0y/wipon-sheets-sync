@@ -4,12 +4,18 @@ service_account.json
 *.json.key
 credentials*.json
 
-# Рабочие файлы скрипта (создаются автоматически)
+# Рабочие файлы скрипта (создаются автоматически).
+# У второго и следующих аккаунтов Wipon они с номером: token_2.json, state_2.json...
 token.json
+token_*.json
 state.json
+state_*.json
 state.tmp
+state_*.tmp
 items_cache.json
+items_cache_*.json
 raw_sale_sample.json
+raw_sale_sample_*.json
 sync.log
 sync.log.*
 

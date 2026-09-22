@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from config import Config
+from config import Config, WiponAccount
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +32,17 @@ class WiponAuthError(WiponError):
 
 
 class WiponClient:
-    """Клиент API Wipon.
+    """Клиент API Wipon для одного аккаунта.
 
     Хранит внутри себя requests.Session (одно TCP-соединение переиспользуется)
-    и текущий access_token.
+    и текущий access_token. Общие настройки (адрес API, таймауты, пагинация)
+    берутся из cfg, а логин, пароль, ID сотрудника и файлы токена/кеша —
+    из account: у каждой кассы они свои.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, account: WiponAccount):
         self.cfg = cfg
+        self.account = account
         self.session = requests.Session()
         # Заголовки, общие для всех запросов. Accept: application/json —
         # так API отвечает JSON-ом, а не HTML-страницей ошибки.
@@ -63,7 +66,7 @@ class WiponClient:
         Токен по документации живёт год (expires_in = 31536000 секунд),
         поэтому дёргать /oauth/token при каждом запуске бессмысленно.
         """
-        path = self.cfg.token_file
+        path = self.account.token_file
         if not path.is_file():
             return False
         try:
@@ -100,7 +103,7 @@ class WiponClient:
             "company_id": company_id,
             "obtained_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.cfg.token_file.write_text(
+        self.account.token_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         self._access_token = token
@@ -115,15 +118,15 @@ class WiponClient:
         if not force and (self._access_token or self._load_token_from_disk()):
             return self._access_token  # type: ignore[return-value]
 
-        self.cfg.validate_wipon()
+        self.account.validate()
         url = f"{self.cfg.api_url}/v1/oauth/token"
-        log.info("Запрашиваю новый access_token: POST %s", url)
+        log.info("%s: запрашиваю новый access_token: POST %s", self.account.title, url)
 
         # Тело запроса ровно как в документации: username и password.
         response = self._request(
             "POST",
             url,
-            json={"username": self.cfg.username, "password": self.cfg.password},
+            json={"username": self.account.username, "password": self.account.password},
             with_auth=False,
         )
         try:
@@ -227,7 +230,7 @@ class WiponClient:
         для продаж явного описания нет, поэтому идём по страницам и
         останавливаемся, как только страница вернулась неполной или пустой.
         """
-        url = f"{self.cfg.api_url}/v1/employee/{self.cfg.employee_id}/sale"
+        url = f"{self.cfg.api_url}/v1/employee/{self.account.employee_id}/sale"
         sales: List[Dict[str, Any]] = []
         seen_ids: set = set()
 
@@ -239,8 +242,8 @@ class WiponClient:
                 "per_page": self.cfg.per_page,
             }
             # stock_id — необязательный фильтр по складу из документации.
-            if self.cfg.stock_id:
-                params["stock_id"] = self.cfg.stock_id
+            if self.account.stock_id:
+                params["stock_id"] = self.account.stock_id
 
             log.debug("GET %s params=%s", url, params)
             payload = self._get_json(url, params)
@@ -282,7 +285,7 @@ class WiponClient:
         Поля из документации, которые нам нужны: id, title, barcode.
         Пагинация: параметры page и per_page задокументированы.
         """
-        url = f"{self.cfg.api_url}/v2/employee/{self.cfg.employee_id}/item"
+        url = f"{self.cfg.api_url}/v2/employee/{self.account.employee_id}/item"
         items: List[Dict[str, Any]] = []
 
         for page in range(1, self.cfg.max_pages + 1):
@@ -308,7 +311,7 @@ class WiponClient:
         Такой кеш лежит в items_cache.json и обновляется раз в ITEMS_CACHE_TTL_HOURS,
         чтобы не дёргать API на каждую строку продажи.
         """
-        cache_path = self.cfg.items_cache_file
+        cache_path = self.account.items_cache_file
         ttl = timedelta(hours=self.cfg.items_cache_ttl_hours)
 
         if not force_refresh and cache_path.is_file():

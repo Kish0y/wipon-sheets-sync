@@ -142,7 +142,9 @@ class WiponClient:
         # считаем, что токен живёт сутки, чтобы не улететь в вечный кеш.
         expires_in = int(data.get("expires_in") or 86400)
         self._save_token_to_disk(token, expires_in, data.get("company_id"))
-        log.info("Токен получен, expires_in=%s сек, company_id=%s", expires_in, data.get("company_id"))
+        # company_id в лог не пишем: на GitHub логи запусков публичные.
+        # Он сохраняется в token.json, если понадобится для разбора.
+        log.info("Токен получен, expires_in=%s сек", expires_in)
         return token
 
     # ------------------------------------------------------------------

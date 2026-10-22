@@ -41,7 +41,7 @@ ITEMS_FIELDS = ("item_sale", "items", "item_sales", "sale_items")
 TITLE_FIELDS = ("title", "quick_title", "item_title", "name")
 
 # Где искать филиал (точку продажи). В боевом ответе это объект stock:
-#   "stock": {"id": 69602, "name": "2 точка", ...}
+#   "stock": {"id": 2, "name": "2 точка", ...}
 # Если его вдруг не окажется, пробуем кассу — она тоже привязана к точке.
 BRANCH_SOURCES = ("stock", "cashbox")
 
@@ -361,7 +361,7 @@ def build_branch_summary(by_branch: Mapping[str, Sequence[Sequence[Any]]]) -> di
     Строка блока устроена так:
         [дата, товар, количество, цена, сумма, ID продажи]
 
-    Возвращаем {"2 точка": {"quantity": 27.0, "total": 317358.02, "receipts": 24}}.
+    Возвращаем {"2 точка": {"quantity": 20.0, "total": 240000.0, "receipts": 18}}.
     Чеки считаем по уникальным ID: в одном чеке товар может встретиться
     несколькими строками, но чек при этом один.
     """
